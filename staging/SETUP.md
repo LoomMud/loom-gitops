@@ -3,16 +3,23 @@ SPDX-FileCopyrightText: 2026 Oberfield
 SPDX-License-Identifier: AGPL-3.0-only
 -->
 
-# Loom staging host: board setup guide (Ubuntu 26.04 LTS)
+# Loom host (`loom`): board setup guide (Ubuntu 26.04 LTS)
 
-**Audience:** Oberfield board admins provisioning the Docker Compose staging host requested in OBI-56.
-**Target:** Ubuntu Server **26.04 LTS "Resolute Raccoon"**, x86_64 (amd64).
-**Design reference:** OBI-8 plan r4 §3.4 (decisions D-P1.7 to D-P1.14). Stack implementation: R6 / OBI-42 (Legolas).
+**Audience:** Oberfield board admins provisioning the Docker Compose host requested in OBI-56.
+**Target:** Ubuntu Server **26.04 LTS "Resolute Raccoon"**, x86_64 (amd64). Machine name **`loom`**.
+**Names:** admins reach the machine directly at **`system.loommud.com`** (DNS only). Players and the web reach it at **`loommud.com`** and **`www.loommud.com`**, which are **proxied through Cloudflare**.
+**Backups:** **Azure Blob Storage** (replaces the S3 bucket in earlier revisions).
+**Design reference:** OBI-8 plan r4 §3.4 (decisions D-P1.7 to D-P1.14). Stack implementation: R6 / OBI-42 (Legolas). The stack files still live under `staging/` in this repo. That is the repo layout R6 chose, not a host, user or DNS name.
 **Time:** about 60–90 min for sections 1–8, plus about 15 min for section 9 (after R6 ships `staging/bootstrap.sh`).
 
-> **Golden rule.** The only things that ever go into a Paperclip comment are the **hostname**, the **public IP** and the **age public key** (`age1…`). Every other value in this guide (bucket key, GitHub tokens, Postgres password, age *private* key) goes into `/etc/loom-staging/secrets.env` on the host and/or the board password manager, and nowhere else. See §10.
+> **Golden rule.** The only things that ever go into a Paperclip comment are the **hostnames**, the **public IP** and the **age public key** (`age1…`). Every other value in this guide (Azure SAS token, storage account key, GitHub tokens, Postgres password, Cloudflare credentials, age *private* key) goes into `/etc/loom/secrets.env` on the host and/or the board password manager, and nowhere else. See §10.
 
 Items marked **TBD-by-R6** depend on files R6 (OBI-42) has not shipped yet. Do not guess them. Skip that step until the repo has the file, or ask on OBI-42.
+
+### What changed in this revision (OBI-62)
+- Machine name `loom`. Service user `loom` (was `loom-staging`). Secrets directory `/etc/loom` (was `/etc/loom-staging`). No "staging" in any user or DNS name.
+- DNS: `system.loommud.com` (DNS only, direct: SSH and telnet) plus `loommud.com` / `www.loommud.com` (Cloudflare-proxied: HTTPS and WSS). New §5 covers Cloudflare settings; §4.5 limits 80/443 to Cloudflare; §9 checks updated.
+- Backups: Azure Blob Storage with a container-scoped SAS token and an Azure lifecycle policy, instead of AWS/S3 (§6).
 
 ---
 
@@ -21,9 +28,9 @@ Items marked **TBD-by-R6** depend on files R6 (OBI-42) has not shipped yet. Do n
 | OBI-56 item | Section(s) |
 |---|---|
 | 1. Host: VM, Docker ≥ 24 + Compose v2, systemd, git, Docker at boot, outbound HTTPS | §1 Base OS, §2 Packages, §3 Users & permissions, §4.4 Outbound |
-| 2. DNS hostname with A/AAAA | §5 DNS |
+| 2. DNS hostname with A/AAAA | §5 DNS & Cloudflare |
 | 3. Firewall: 4000/80/443 in, SSH for admins only, rest closed | §3.2 SSH hardening, §4 Firewall |
-| 4. Backup bucket, scoped key, ~90-day lifecycle | §6 Backup bucket |
+| 4. Backup bucket, scoped key, ~90-day lifecycle | §6 Backup storage (Azure Blob) |
 | 5. age keypair, private key offline, post public key | §7 age keypair |
 | 6. GitHub fine-grained token (commit statuses only) | §8.1 GitHub token |
 | 7. GHCR public (fallback `read:packages` token) | §8.2 GHCR |
@@ -39,27 +46,32 @@ Suggested order: §0 → §1 → §2 → §3 → §4 → §5, with §6, §7 and 
 
 Fill this in before you start (in your password manager or on paper, **not** in Paperclip). The shell snippets below use these names.
 
-| Name | Example | Secret? |
+| Name | Value / example | Secret? |
 |---|---|---|
-| `DOMAIN` | `example.org` | no |
-| `STAGING_FQDN` | `staging.example.org` | no (post on OBI-56) |
+| Machine name | `loom` | no |
+| `SYSTEM_FQDN` | `system.loommud.com` (DNS only, points straight at the host) | no (post on OBI-56) |
+| `PUBLIC_FQDNS` | `loommud.com`, `www.loommud.com` (Cloudflare-proxied) | no |
 | `PUBLIC_IPV4` | `203.0.113.10` | no (post on OBI-56) |
 | `PUBLIC_IPV6` | `2001:db8::10`, or *none* | no |
 | `ADMIN_USER` | `alice` (one per board admin) | no |
 | `ADMIN_SRC_IPS` | `198.51.100.7/32` (board admins' public IPs) | keep private, not secret |
-| `BUCKET` | `loom-staging-backups` | no |
-| `S3_ENDPOINT` / `S3_REGION` | `https://s3.eu-central-1.amazonaws.com` / `eu-central-1` | no |
-| Bucket access key ID + secret | … | **SECRET** |
+| `AZ_RG` | `loom-backups-rg` (Azure resource group) | no |
+| `AZ_REGION` | `westeurope` | no |
+| `AZ_STORAGE_ACCOUNT` | `loommudbackups` (globally unique, 3–24 lowercase letters/digits) | no |
+| `AZ_CONTAINER` | `loom-backups` | no |
+| Storage account key | … (used on the admin workstation only, **never** on the host) | **SECRET** |
+| Container SAS token | `sp=…&sig=…` | **SECRET** |
 | GitHub fine-grained token (statuses) | `github_pat_…` | **SECRET** |
 | GHCR `read:packages` token (fallback only) | `ghp_…` | **SECRET** |
 | Postgres password | generated in §9 | **SECRET** |
+| Cloudflare account login | … | **SECRET** (password manager) |
 | age private key | `AGE-SECRET-KEY-1…` | **SECRET, offline only, never on the host** |
 | age public key | `age1…` | no (post on OBI-56) |
 
 ### 0.2 What you need
 - A cloud/VPS account (any provider with Ubuntu 26.04 images) or a hypervisor.
-- DNS control for `DOMAIN`.
-- An S3-compatible object store account (AWS S3, Backblaze B2, Cloudflare R2, Wasabi, MinIO, …), ideally **a different provider/account from the VM**, so that losing the host account doesn't also lose the backups.
+- The `loommud.com` zone on **Cloudflare**, with rights to edit DNS and SSL/TLS settings.
+- An **Azure subscription** where you can create a resource group and storage account, and the Azure CLI (`az`) on an admin workstation (`az login`). Ideally the VM is **not** in the same Azure subscription, so losing the host account doesn't also lose the backups.
 - An SSH key pair on each admin's workstation (`ssh-keygen -t ed25519` if you don't have one).
 - Owner/admin rights on the `LoomMud` GitHub org (for the token policy and GHCR visibility).
 - `age` on an offline or trusted workstation (§7).
@@ -69,13 +81,14 @@ Fill this in before you start (in your password manager or on paper, **not** in 
 ## 1. Base OS
 
 ### 1.1 Create the VM
+- **Name:** `loom`.
 - **Image:** Ubuntu Server 26.04 LTS, amd64 (the minimal or cloud image is fine).
 - **Size:** at least **2 vCPU / 4 GB RAM / 40 GB SSD**. Use one disk; no extra volumes are needed (Docker named volumes live under `/var/lib/docker`).
 - **Network:** a static public IPv4 (reserved/elastic IP). IPv6 is optional; see §5 before you publish an AAAA record.
-- **Provider firewall / security group** (if the provider has one): allow inbound TCP 22 from `ADMIN_SRC_IPS` only, and TCP 80, 443 and 4000 from anywhere. Deny everything else. This is a second layer on top of ufw (§4).
+- **Provider firewall / security group** (if the provider has one): allow inbound TCP 22 from `ADMIN_SRC_IPS` only, TCP 4000 from anywhere, and TCP 80/443 from anywhere (or from Cloudflare's ranges only, see §4.5). Deny everything else. This is a second layer on top of ufw (§4).
 - **SSH key:** inject the first admin's public key at creation (cloud-init). Most images create a default `ubuntu` user with it.
 
-SSH in as the default user (for example `ssh ubuntu@PUBLIC_IPV4`). Everything below runs on the host unless it says otherwise.
+SSH in as the default user (for example `ssh ubuntu@PUBLIC_IPV4`; once §5 is done, `ssh ubuntu@system.loommud.com`). Everything below runs on the host unless it says otherwise.
 
 ### 1.2 Update the system
 ```bash
@@ -88,14 +101,14 @@ sudo apt autoremove -y
 
 ### 1.3 Hostname
 ```bash
-sudo hostnamectl set-hostname loom-staging
+sudo hostnamectl set-hostname loom
 # Stop cloud-init from resetting it on reboot
 echo 'preserve_hostname: true' | sudo tee /etc/cloud/cloud.cfg.d/99-loom-hostname.cfg
 # Make sure the name resolves locally
-grep -q 'loom-staging' /etc/hosts || echo '127.0.1.1 loom-staging' | sudo tee -a /etc/hosts
-hostnamectl
+grep -qw 'loom' /etc/hosts || echo '127.0.1.1 system.loommud.com loom' | sudo tee -a /etc/hosts
+hostnamectl                # expect: Static hostname: loom
 ```
-(The OS hostname is internal. The public name is `STAGING_FQDN` in DNS, §5.)
+The OS hostname is `loom`. Its public, direct name is `system.loommud.com` (§5).
 
 ### 1.4 Timezone and NTP
 Use UTC on servers, so logs, backup timestamps and GitHub statuses line up.
@@ -210,10 +223,12 @@ sudo apt install -y \
 | `git` | clone and fast-forward `loom-gitops` (reconciler, D-P1.8) |
 | `age` | backup encryption tooling; lets the board run the restore drill with the offline key (D-P1.12). The host only ever holds the **public** key. |
 | `ufw` | host firewall (§4) |
-| `jq`, `curl` | reconciler posts the GitHub commit status; verification commands |
+| `jq`, `curl` | reconciler posts the GitHub commit status; verification commands; Cloudflare IP list (§4.5) |
 | `openssl` | generates the Postgres password; TLS checks |
 | `dnsutils`, `netcat-openbsd`, `telnet` | DNS, port and telnet verification (§5, §9) |
 | `cosign` | the reconciler verifies image signatures before deploying (D-P1.8). Ubuntu 26.04 universe ships cosign 2.x. **TBD-by-R6:** R6 may run cosign from a pinned container instead. Installing the package is harmless either way. |
+
+The Azure CLI is **not** needed on the host. Backups upload from inside the `backup` container with `rclone` (Azure Blob backend) and a SAS token (§6).
 
 **TBD-by-R6:** any further host prerequisites that `staging/bootstrap.sh` checks for. The design keeps `pg_dump`, `rclone` and `age` for backups **inside** the `backup` container, so the host needs nothing more for them. If `bootstrap.sh` reports a missing command, install it with `apt` and note it on OBI-42.
 
@@ -271,28 +286,30 @@ sudo sshd -T | grep -Ei '^(permitrootlogin|passwordauthentication|kbdinteractive
 # expect: permitrootlogin no / passwordauthentication no / kbdinteractiveauthentication no / allowgroups sudo
 sudo passwd -l root        # lock the root password (it's normally locked already)
 ```
-Check from your workstation, in a **new** session:
+Check from your workstation, in a **new** session (use `PUBLIC_IPV4` until §5 is done):
 ```bash
-ssh ADMIN_USER@PUBLIC_IPV4                                                    # works (key)
-ssh -o PubkeyAuthentication=no -o PreferredAuthentications=password ADMIN_USER@PUBLIC_IPV4   # must fail: "Permission denied (publickey)"
-ssh root@PUBLIC_IPV4                                                          # must fail
+ssh ADMIN_USER@system.loommud.com                                                    # works (key)
+ssh -o PubkeyAuthentication=no -o PreferredAuthentications=password ADMIN_USER@system.loommud.com   # must fail: "Permission denied (publickey)"
+ssh root@system.loommud.com                                                          # must fail
 ```
+SSH always goes to `system.loommud.com`. `loommud.com` and `www` resolve to Cloudflare, which doesn't carry SSH.
+
 Once your named admin works, disable the image's default user: `sudo usermod -L -s /usr/sbin/nologin ubuntu && sudo gpasswd -d ubuntu sudo`. To remove it completely, use `sudo deluser --remove-home ubuntu`.
 
 (SSH source-IP restriction is done in the firewall, §4.2.)
 
-### 3.3 Service user for Loom staging
+### 3.3 Service user `loom`
 One dedicated **system** account, with no login shell and no password. It owns the `loom-gitops` clone and runs the reconciler.
 ```bash
 sudo useradd --system --user-group \
-  --home-dir /var/lib/loom-staging --create-home \
+  --home-dir /var/lib/loom --create-home \
   --shell /usr/sbin/nologin \
-  --comment "Loom staging reconciler" loom-staging
-sudo usermod -aG docker loom-staging
-id loom-staging            # expect: groups include loom-staging and docker
+  --comment "Loom reconciler" loom
+sudo usermod -aG docker loom
+id loom                    # expect: groups include loom and docker
 ```
 
-> **Caveat: `docker` group = root.** Any member of the `docker` group can start a privileged container that mounts `/` and so gets full root on the host. `loom-staging` needs this, because the reconciler runs `docker compose`. The account is safe only because:
+> **Caveat: `docker` group = root.** Any member of the `docker` group can start a privileged container that mounts `/` and so gets full root on the host. `loom` needs this, because the reconciler runs `docker compose`. The account is safe only because:
 > - it has no password and no login shell, and SSH is limited to the `sudo` group (§3.2);
 > - nothing agent-controlled can reach it. Agents influence the host only through reviewed PRs to `loom-gitops`, and every image digest is cosign-verified before it runs (D-P1.8);
 > - admins do **not** join `docker`. They use `sudo docker`, so root-level actions stay explicit and logged by sudo.
@@ -301,27 +318,27 @@ id loom-staging            # expect: groups include loom-staging and docker
 
 ### 3.4 Secrets directory and file
 ```bash
-sudo install -d -o root -g loom-staging -m 0750 /etc/loom-staging
+sudo install -d -o root -g loom -m 0750 /etc/loom
 # Empty placeholder with the right owner/mode. It's filled in during §9 from secrets.env.example.
-sudo install -o root -g loom-staging -m 0640 /dev/null /etc/loom-staging/secrets.env
-sudo stat -c '%n %U:%G %a' /etc/loom-staging /etc/loom-staging/secrets.env
-# expect: /etc/loom-staging root:loom-staging 750
-#         /etc/loom-staging/secrets.env root:loom-staging 640
+sudo install -o root -g loom -m 0640 /dev/null /etc/loom/secrets.env
+sudo stat -c '%n %U:%G %a' /etc/loom /etc/loom/secrets.env
+# expect: /etc/loom root:loom 750
+#         /etc/loom/secrets.env root:loom 640
 ```
-Why `root:loom-staging 0640`: root owns the file, so the service account can **read** it (Compose reads `env_file` on the client side) but can't change it. Nobody else can read it.
+Why `root:loom 0640`: root owns the file, so the service account can **read** it (Compose reads `env_file` on the client side) but can't change it. Nobody else can read it.
 
-**Note for R6 (CTO decision, supersedes "root, 0600" in D-P1.13):** the reconciler systemd unit runs as `User=loom-staging`, so the file is `root:loom-staging 0640` and the directory is `root:loom-staging 0750`. If `bootstrap.sh` enforces modes, it must enforce these.
+**Note for R6 (CTO decision, supersedes "root, 0600" in D-P1.13):** the reconciler systemd unit runs as `User=loom`, so the file is `/etc/loom/secrets.env` `root:loom 0640` and the directory is `/etc/loom` `root:loom 0750`. If `bootstrap.sh` enforces paths or modes, it must enforce these.
 
 ### 3.5 `loom-gitops` clone location
 `LoomMud/loom-gitops` is a **public** repo, so the clone needs no credentials.
 ```bash
-sudo install -d -o loom-staging -g loom-staging -m 0755 /opt/loom-gitops
-sudo -u loom-staging git clone https://github.com/LoomMud/loom-gitops.git /opt/loom-gitops
+sudo install -d -o loom -g loom -m 0755 /opt/loom-gitops
+sudo -u loom git clone https://github.com/LoomMud/loom-gitops.git /opt/loom-gitops
 # Let root/admins run read-only git commands in the service-owned clone without "dubious ownership" errors
 sudo git config --system --add safe.directory /opt/loom-gitops
-sudo -u loom-staging git -C /opt/loom-gitops log --oneline -1
+sudo -u loom git -C /opt/loom-gitops log --oneline -1
 ```
-- **Clone path:** `/opt/loom-gitops`, owned by `loom-staging`. Only the reconciler writes to it (fast-forwarding `main`).
+- **Clone path:** `/opt/loom-gitops`, owned by `loom`. Only the reconciler writes to it (fast-forwarding `main`).
 - **Never edit files in this clone by hand.** Changes go through PRs. The reconciler fast-forwards, and local edits would block it.
 - **TBD-by-R6:** if `bootstrap.sh` expects a different clone path, follow the runbook and tell the CTO so this guide gets updated.
 
@@ -348,9 +365,9 @@ sudo ufw allow from 198.51.100.7/32 to any port 22 proto tcp comment 'ssh board-
 # sudo ufw allow from 2001:db8:abcd::/48 to any port 22 proto tcp comment 'ssh board-admin v6'
 
 # Public services
-sudo ufw allow 80/tcp   comment 'http (ACME + redirect)'
-sudo ufw allow 443/tcp  comment 'https/wss (caddy)'
-sudo ufw allow 4000/tcp comment 'telnet (loom)'
+sudo ufw allow 80/tcp   comment 'http (ACME + redirect, via Cloudflare)'
+sudo ufw allow 443/tcp  comment 'https/wss (caddy, via Cloudflare)'
+sudo ufw allow 4000/tcp comment 'telnet (loom, direct)'
 
 sudo ufw logging low
 sudo ufw --force enable
@@ -367,9 +384,9 @@ If admin IPs change often, use a VPN/Tailscale range as `ADMIN_SRC_IPS` rather t
 EXT_IF=$(ip -o -4 route show to default | awk '{print $5; exit}')
 for f in /etc/ufw/after.rules /etc/ufw/after6.rules; do
   sudo cp -n "$f" "$f.orig"
-  sudo sed -i '/^# BEGIN LOOM-STAGING DOCKER-USER/,/^# END LOOM-STAGING DOCKER-USER/d' "$f"
+  sudo sed -i '/^# BEGIN LOOM DOCKER-USER/,/^# END LOOM DOCKER-USER/d' "$f"
   sudo tee -a "$f" >/dev/null <<EOF
-# BEGIN LOOM-STAGING DOCKER-USER
+# BEGIN LOOM DOCKER-USER
 # Only 80/443/4000 may be forwarded from the public interface to containers.
 *filter
 :DOCKER-USER - [0:0]
@@ -380,7 +397,7 @@ for f in /etc/ufw/after.rules /etc/ufw/after6.rules; do
 -A DOCKER-USER -p tcp -m conntrack --ctorigdstport 4000 --ctdir ORIGINAL -j RETURN
 -A DOCKER-USER -j DROP
 COMMIT
-# END LOOM-STAGING DOCKER-USER
+# END LOOM DOCKER-USER
 EOF
 done
 sudo ufw reload
@@ -400,13 +417,13 @@ sudo docker run -d --rm --name fwtest -p 4000:80 -p 8081:80 nginx:alpine
 ```
 Then from your workstation:
 ```bash
-nc -vz  -w 5 PUBLIC_IPV4 4000     # must SUCCEED (allowed)
-nc -vz  -w 5 PUBLIC_IPV4 8081     # must FAIL/time out (the DOCKER-USER drop works)
+nc -vz  -w 5 system.loommud.com 4000     # must SUCCEED (allowed)
+nc -vz  -w 5 system.loommud.com 8081     # must FAIL/time out (the DOCKER-USER drop works)
 ```
 Clean up on the host: `sudo docker rm -f fwtest && sudo docker image rm nginx:alpine`.
 
 ### 4.4 Outbound
-Leave outbound open (`ufw default allow outgoing`). GitHub, GHCR and ACME are served from rotating CDN IPs, so pinning egress by IP is fragile and not worth the risk for staging. If your provider **does** filter egress, allow these:
+Leave outbound open (`ufw default allow outgoing`). GitHub, GHCR, ACME and Azure are served from rotating CDN IPs, so pinning egress by IP is fragile and not worth the risk here. If your provider **does** filter egress, allow these:
 
 | Destination | Port | Used by |
 |---|---|---|
@@ -415,123 +432,245 @@ Leave outbound open (`ufw default allow outgoing`). GitHub, GHCR and ACME are se
 | `ghcr.io`, `pkg-containers.githubusercontent.com` | 443 | pull `ghcr.io/loommud/loom` (and blobs) |
 | `registry-1.docker.io`, `auth.docker.io`, `production.cloudflare.docker.com` | 443 | pull `caddy`, `postgres`, `alpine/git` support images |
 | `fulcio.sigstore.dev`, `rekor.sigstore.dev`, `tuf-repo-cdn.sigstore.dev` | 443 | `cosign verify` (keyless, Sigstore) |
-| `acme-v02.api.letsencrypt.org` (and `acme.zerossl.com`, Caddy's fallback CA) | 443 | TLS certificates |
-| your bucket endpoint (for example `s3.<region>.amazonaws.com`) | 443 | backups |
+| `acme-v02.api.letsencrypt.org` (and `acme.zerossl.com`, Caddy's fallback CA) | 443 | origin TLS certificates |
+| `<AZ_STORAGE_ACCOUNT>.blob.core.windows.net` | 443 | backups (Azure Blob) |
+| `www.cloudflare.com` | 443 | refresh of Cloudflare IP ranges (§4.5), if you use it |
 | `archive.ubuntu.com`, `security.ubuntu.com`, `download.docker.com` | 80/443 | OS and Docker updates |
 | NTP/NTS servers (`ntp.ubuntu.com`, …) | UDP 123, TCP 4460 | time sync (chrony/NTS) |
 | DNS resolvers | 53 | name resolution |
 
-Quick outbound check from the host:
+Quick outbound check from the host (set `SA` to your storage account name):
 ```bash
-for u in https://github.com https://api.github.com https://ghcr.io/v2/ https://acme-v02.api.letsencrypt.org/directory https://rekor.sigstore.dev https://registry-1.docker.io/v2/; do
+SA=loommudbackups
+for u in https://github.com https://api.github.com https://ghcr.io/v2/ https://acme-v02.api.letsencrypt.org/directory https://rekor.sigstore.dev https://registry-1.docker.io/v2/ "https://$SA.blob.core.windows.net/"; do
   printf '%-55s ' "$u"; curl -s -o /dev/null -w '%{http_code}\n' --max-time 10 "$u"
 done
-# Any HTTP code (200/301/401/404) means it's reachable; 000 means blocked.
+# Any HTTP code (200/301/400/401/404) means it's reachable; 000 means blocked.
 ```
+
+### 4.5 Limit 80/443 to Cloudflare (recommended)
+`loommud.com` and `www` are proxied, so all legitimate web traffic arrives from Cloudflare's IP ranges. The origin IP is public anyway (through `system.loommud.com`), so without this step anyone can bypass Cloudflare by sending `Host: loommud.com` straight to the IP. This step closes 80/443 to everything except Cloudflare. Port **4000 (telnet) and 22 are not affected**. Telnet is never proxied (§5.3).
+
+Let's Encrypt HTTP-01 validation still works, because it reaches the origin **through** Cloudflare.
+
+Run on the host. The script replaces the §4.2 `80/tcp` and `443/tcp` rules, and inserts a Cloudflare-only filter for 80/443 into `DOCKER-USER` (Docker bypasses ufw, §4.3):
+```bash
+sudo tee /usr/local/sbin/loom-cloudflare-fw >/dev/null <<'SCRIPT'
+#!/bin/sh
+# Restrict inbound 80/443 (host + Docker-published) to Cloudflare's published ranges.
+set -eu
+EXT_IF=$(ip -o -4 route show to default | awk '{print $5; exit}')
+V4=$(curl -fsS --max-time 20 https://www.cloudflare.com/ips-v4)
+V6=$(curl -fsS --max-time 20 https://www.cloudflare.com/ips-v6)
+[ -n "$V4" ] && [ -n "$V6" ] || { echo "empty Cloudflare IP list, aborting" >&2; exit 1; }
+
+# 1. ufw (host INPUT): drop the open 80/443 rules, allow Cloudflare only
+ufw --force delete allow 80/tcp  >/dev/null 2>&1 || true
+ufw --force delete allow 443/tcp >/dev/null 2>&1 || true
+for cidr in $V4 $V6; do
+  ufw allow proto tcp from "$cidr" to any port 80,443 comment 'cloudflare' >/dev/null
+done
+
+# 2. DOCKER-USER (forwarded to containers): 80/443 only from Cloudflare
+for fam in 4 6; do
+  f=/etc/ufw/after.rules; [ "$fam" = 6 ] && f=/etc/ufw/after6.rules
+  list=$V4; [ "$fam" = 6 ] && list=$V6
+  sed -i '/^# BEGIN LOOM CLOUDFLARE/,/^# END LOOM CLOUDFLARE/d' "$f"
+  {
+    echo "# BEGIN LOOM CLOUDFLARE"
+    echo "*filter"
+    echo ":LOOM-CF - [0:0]"
+    echo "-F LOOM-CF"
+    for cidr in $list; do echo "-A LOOM-CF -s $cidr -j RETURN"; done
+    echo "-A LOOM-CF -j DROP"
+    # Inserted at position 3: after the ESTABLISHED and non-public-interface RETURNs from §4.3,
+    # before its 80/443/4000 RETURNs. Needs the §4.3 block to come earlier in the same file.
+    echo "-I DOCKER-USER 3 -i $EXT_IF -p tcp -m conntrack --ctdir ORIGINAL --ctorigdstport 443 -j LOOM-CF"
+    echo "-I DOCKER-USER 3 -i $EXT_IF -p tcp -m conntrack --ctdir ORIGINAL --ctorigdstport 80 -j LOOM-CF"
+    echo "COMMIT"
+    echo "# END LOOM CLOUDFLARE"
+  } >> "$f"
+done
+ufw reload
+SCRIPT
+sudo chmod 0755 /usr/local/sbin/loom-cloudflare-fw
+sudo /usr/local/sbin/loom-cloudflare-fw
+sudo systemctl restart docker
+sudo ufw status | grep -c cloudflare          # expect about 20+ rules
+sudo iptables -S DOCKER-USER | head -5        # expect jumps to LOOM-CF before the 80/443 RETURNs
+sudo iptables -S LOOM-CF | tail -2            # expect "... -j RETURN" then "-j DROP"
+```
+How it works: new connections to 80/443 on the public interface jump to `LOOM-CF`. That chain returns (on to the §4.3 allow rules) for Cloudflare sources and drops everything else.
+
+Cloudflare rarely changes its ranges, but check monthly: re-run `sudo /usr/local/sbin/loom-cloudflare-fw && sudo systemctl restart docker`.
+
+Check from a workstation (not through Cloudflare):
+```bash
+curl -sS --max-time 8 -o /dev/null -w '%{http_code}\n' --resolve loommud.com:443:PUBLIC_IPV4 https://loommud.com/   # must time out (000)
+curl -sS -o /dev/null -w '%{http_code}\n' https://loommud.com/                                                    # through Cloudflare: works (after §9)
+```
+To undo: `sudo sed -i '/^# BEGIN LOOM CLOUDFLARE/,/^# END LOOM CLOUDFLARE/d' /etc/ufw/after.rules /etc/ufw/after6.rules`, delete the `cloudflare` ufw rules, re-add `ufw allow 80/tcp` and `ufw allow 443/tcp`, then `sudo ufw reload && sudo systemctl restart docker`.
+
+Also restrict 80/443 to Cloudflare in the provider firewall (§1.1) if it supports it.
 
 ---
 
-## 5. DNS
+## 5. DNS & Cloudflare
 
-1. At your DNS provider, create:
-   - `staging.<domain>.  300  IN  A     PUBLIC_IPV4`
-   - `staging.<domain>.  300  IN  AAAA  PUBLIC_IPV6` **only if** the host has working public IPv6 **and** ports 80/443/4000 are open on IPv6 (ufw rules in §4.2 cover v6 by default; check the provider firewall too). Let's Encrypt prefers IPv6 when an AAAA record exists, so a broken AAAA record makes certificate issuance fail. If in doubt, publish only the A record.
-2. If `<domain>` has **CAA** records, they must allow the CA Caddy uses:
-   ```bash
-   dig +short CAA <domain>
-   # If there's output, add:  <domain>. CAA 0 issue "letsencrypt.org"   (and optionally: 0 issue "sectigo.com" for ZeroSSL)
-   ```
-3. Find the host's real public addresses (on the host):
-   ```bash
-   curl -4 -s https://api.ipify.org; echo
-   curl -6 -s --max-time 5 https://api6.ipify.org; echo    # empty or an error = no public IPv6
-   ```
-4. Verify from your workstation. Both must match step 3:
-   ```bash
-   dig +short A    staging.<domain> @1.1.1.1
-   dig +short A    staging.<domain> @8.8.8.8
-   dig +short AAAA staging.<domain> @1.1.1.1       # empty unless you published AAAA
-   ```
-   Wait for these to return the right IP **before** running the bootstrap (§9). Caddy requests the certificate on first start.
+### 5.1 Records (Cloudflare dashboard → `loommud.com` → DNS → Records)
+
+| Type | Name | Content | Proxy status | Purpose |
+|---|---|---|---|---|
+| A | `system` | `PUBLIC_IPV4` | **DNS only** (grey cloud) | SSH (admins) and telnet :4000 (players): direct to the host |
+| AAAA | `system` | `PUBLIC_IPV6` | **DNS only** | only if the host has working public IPv6 with 22/4000 open on v6 |
+| A | `@` (`loommud.com`) | `PUBLIC_IPV4` | **Proxied** (orange cloud) | HTTPS / WSS web client, via Cloudflare |
+| CNAME | `www` | `loommud.com` | **Proxied** | same, via Cloudflare |
+| AAAA | `@` | `PUBLIC_IPV6` | Proxied | optional. Cloudflare serves IPv6 to visitors either way; only add this if the origin's v6 works on 80/443. |
+
+TTL: *Auto*. `system` **must** stay DNS only. Cloudflare's proxy carries only HTTP(S) on a fixed port list (443, 80, 8443, …). It does not carry SSH or port 4000.
+
+### 5.2 Cloudflare zone settings
+- **SSL/TLS → Overview → encryption mode: Full (strict).** Cloudflare connects to the origin over HTTPS and checks the origin's certificate. Caddy gets a real Let's Encrypt certificate for `loommud.com` and `www.loommud.com` (§9). Until it does, the site shows Cloudflare error 526. That's expected before the bootstrap. Don't use *Flexible*: it sends traffic to the origin over plain HTTP and causes redirect loops with Caddy.
+- **SSL/TLS → Edge Certificates → Always Use HTTPS: Off.** Caddy already redirects HTTP to HTTPS, and it leaves `/.well-known/acme-challenge/` on HTTP so Let's Encrypt can validate. Turning it on at the edge can break certificate issuance and renewal.
+- **SSL/TLS → Edge Certificates → Minimum TLS version:** 1.2.
+- **Network → WebSockets: On** (the default). The web client uses WSS.
+- **Caching:** the default rules don't cache HTML or WebSocket traffic, so leave them. Don't add "Cache Everything" rules.
+- **Security → Bots:** if you turn on *Bot Fight Mode*, check afterwards that the web client still connects (X10 in §9.4).
+
+**Fallback if Let's Encrypt can't validate through Cloudflare:** create a **Cloudflare Origin CA** certificate (SSL/TLS → Origin Server) for `loommud.com, *.loommud.com`, and have Caddy use it instead of ACME. Origin CA certificates are trusted by Cloudflare only, which is fine because the public names are always proxied. This needs a Caddyfile change, so raise it on OBI-42 (**TBD-by-R6**).
+
+### 5.3 Telnet goes to `system.loommud.com:4000`
+Cloudflare can't proxy raw TCP on port 4000 without Spectrum (a paid add-on). So:
+- players use **`telnet system.loommud.com 4000`**, straight to the host;
+- `telnet loommud.com 4000` will **not** work (it resolves to Cloudflare).
+
+If you'd rather give players a friendlier telnet name than `system`, add another **DNS only** record later (for example `play` → `PUBLIC_IPV4`). That's a board choice; it doesn't change anything on the host.
+
+### 5.4 CAA
+If `loommud.com` has **CAA** records, they must allow Let's Encrypt (for Caddy's origin certificate) as well as Cloudflare's edge CAs:
+```bash
+dig +short CAA loommud.com
+# If there's output and no "letsencrypt.org", add:  loommud.com. CAA 0 issue "letsencrypt.org"
+```
+Cloudflare adds the CAA records it needs for its own edge certificates automatically.
+
+### 5.5 Verify
+Find the host's real public addresses (on the host):
+```bash
+curl -4 -s https://api.ipify.org; echo
+curl -6 -s --max-time 5 https://api6.ipify.org; echo    # empty or an error = no public IPv6
+```
+From your workstation:
+```bash
+dig +short A system.loommud.com @1.1.1.1      # must equal PUBLIC_IPV4 (direct)
+dig +short A system.loommud.com @8.8.8.8      # same
+dig +short A loommud.com        @1.1.1.1      # must be Cloudflare IPs (104.x / 172.64–71.x), NOT PUBLIC_IPV4
+dig +short A www.loommud.com    @1.1.1.1      # Cloudflare IPs
+curl -sI http://loommud.com/ | grep -iE '^(server|cf-ray):'   # expect: server: cloudflare, cf-ray: …
+```
+Wait for these to return the right answers **before** running the bootstrap (§9). Caddy requests the origin certificate on first start.
 
 ---
 
-## 6. Backup bucket
+## 6. Backup storage (Azure Blob)
 
-What's required (D-P1.12): an S3-compatible bucket, private, with an access key that can **put, list and get in this bucket only** (no delete, no bucket admin), plus a lifecycle rule that expires objects after about 90 days.
+What's required (D-P1.12, now on Azure): a private Azure Blob container, a credential that can **write, list and read in that container only** (no delete, no account admin), plus a lifecycle rule that deletes backups after about 90 days.
 
-### 6.1 Create the bucket
-- Name: `loom-staging-backups` (or your own; note it as `BUCKET`).
-- **Block all public access** on. Default server-side encryption on (SSE-S3 is fine; backups are also age-encrypted before upload).
-- Versioning: optional. If you turn it on, also add a noncurrent-version expiry (below).
+How it maps from the S3 design:
 
-### 6.2 Bucket-scoped access key
-**AWS S3:** create an IAM user (for example `loom-staging-backup`) with **no console access**, attach this inline policy, and create one access key for it:
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Sid": "ListThisBucketOnly",
-      "Effect": "Allow",
-      "Action": ["s3:ListBucket", "s3:GetBucketLocation"],
-      "Resource": "arn:aws:s3:::loom-staging-backups"
-    },
-    {
-      "Sid": "PutGetObjectsNoDelete",
-      "Effect": "Allow",
-      "Action": ["s3:PutObject", "s3:GetObject"],
-      "Resource": "arn:aws:s3:::loom-staging-backups/*"
-    }
-  ]
-}
+| S3 design | Azure |
+|---|---|
+| bucket | storage account `AZ_STORAGE_ACCOUNT` + container `AZ_CONTAINER` |
+| bucket-scoped IAM key (put/list/get) | container **SAS token** with permissions `rcwl` (read, create, write, list; **no** `d` delete), tied to a **stored access policy** so it can be revoked |
+| lifecycle rule | storage account **lifecycle management** policy scoped to the container |
+| `rclone` S3 backend | `rclone` **azureblob** backend (`sas_url`) |
+
+The storage account key has full control of the account. It is used **only** from the admin workstation in this section and **never** goes on the host.
+
+Run all of this from an admin workstation with the Azure CLI (`az login`, then `az account set --subscription <id>`).
+
+### 6.1 Create the storage account and container
+```bash
+AZ_RG=loom-backups-rg
+AZ_REGION=westeurope              # <- your region
+SA=loommudbackups                 # <- AZ_STORAGE_ACCOUNT (globally unique)
+CT=loom-backups                   # <- AZ_CONTAINER
+
+az group create -n "$AZ_RG" -l "$AZ_REGION"
+az storage account create -n "$SA" -g "$AZ_RG" -l "$AZ_REGION" \
+  --kind StorageV2 --sku Standard_LRS --access-tier Cool \
+  --https-only true --min-tls-version TLS1_2 \
+  --allow-blob-public-access false
+# Keep deleted/overwritten backups recoverable for a while (protects against a compromised host overwriting blobs)
+az storage account blob-service-properties update -g "$AZ_RG" --account-name "$SA" \
+  --enable-versioning true \
+  --enable-delete-retention true --delete-retention-days 14
+
+# Admin-only: the account key (stays on this workstation, in a shell variable)
+SA_KEY=$(az storage account keys list -g "$AZ_RG" -n "$SA" --query '[0].value' -o tsv)
+az storage container create --account-name "$SA" --account-key "$SA_KEY" -n "$CT" --public-access off
 ```
-Other providers, same intent:
-- **Backblaze B2:** Application Key → "Allow access to bucket: `loom-staging-backups`", capabilities `listFiles`, `readFiles`, `writeFiles` (no `deleteFiles`). Use the S3 endpoint `https://s3.<region>.backblazeb2.com`.
-- **MinIO:** `mc admin policy create` with the JSON above, then `mc admin user add` + `mc admin policy attach`.
-- **Cloudflare R2:** R2 API tokens can't separate write from delete ("Object Read & Write" includes delete). If you use R2, scope the token to this one bucket and rely on the lifecycle rule plus the fact that backups are timestamped. Note this deviation on OBI-56 (without the token).
+- `Standard_LRS` + `Cool` tier is cheapest for write-mostly backups. Use `Standard_ZRS` if you want zone redundancy. Backups are age-encrypted before upload; Azure also encrypts at rest by default.
+- **Cool tier caveat:** Azure charges an early-deletion fee for blobs deleted within 30 days on Cool. With the 90-day rule that doesn't apply. If R6 later uses 15-day `daily/` expiry (§6.4 option a), switch the account to `--access-tier Hot`.
 
-Put the access key ID and secret **only** in your password manager now, and in `secrets.env` in §9.
+### 6.2 Container-scoped SAS token (write/list/read, no delete)
+Create a **stored access policy** on the container, then a SAS token that references it. Deleting the policy revokes the token immediately, without rotating the account key.
+```bash
+EXPIRY=$(date -u -d '+1 year' +%Y-%m-%dT%H:%MZ 2>/dev/null || date -u -v+1y +%Y-%m-%dT%H:%MZ)   # GNU or macOS date
+az storage container policy create --account-name "$SA" --account-key "$SA_KEY" \
+  --container-name "$CT" --name loom-backup-writer \
+  --permissions rcwl --expiry "$EXPIRY"
+# Generate the SAS token (prints once; copy it straight into the password manager)
+az storage container generate-sas --account-name "$SA" --account-key "$SA_KEY" \
+  --name "$CT" --policy-name loom-backup-writer --https-only -o tsv
+unset SA_KEY
+```
+- Permissions: `r` read, `c` create, `w` write, `l` list. No `d`, so the host can't delete backups. `w` does allow overwriting a blob, which is why §6.1 turns on versioning and soft delete: an overwritten backup's previous version is kept.
+- **Put a calendar reminder** two weeks before `EXPIRY`. To renew: `az storage container policy update … --expiry <new date>` (the token keeps working, same value).
+- **To revoke** (for example, after a leak): `az storage container policy delete --account-name "$SA" --account-key "$SA_KEY" --container-name "$CT" --name loom-backup-writer`, then create a new policy and token. Policy changes can take up to 30 seconds to apply.
+- Keep the SAS token **only** in your password manager now, and in `secrets.env` in §9. R6's backup container uses it as an rclone `azureblob` remote with `sas_url = https://<SA>.blob.core.windows.net/<CT>?<SAS token>` (**TBD-by-R6:** exact variable names; see Appendix A).
 
 ### 6.3 Lifecycle rule (~90 days)
-**AWS** (from an admin workstation with an admin profile; **not** the backup key):
 ```bash
-cat > lifecycle.json <<'EOF'
+cat > lifecycle.json <<EOF
 {
-  "Rules": [
+  "rules": [
     {
-      "ID": "expire-after-90-days",
-      "Status": "Enabled",
-      "Filter": {},
-      "Expiration": { "Days": 90 },
-      "NoncurrentVersionExpiration": { "NoncurrentDays": 30 },
-      "AbortIncompleteMultipartUpload": { "DaysAfterInitiation": 7 }
+      "enabled": true,
+      "name": "expire-after-90-days",
+      "type": "Lifecycle",
+      "definition": {
+        "filters": { "blobTypes": ["blockBlob"], "prefixMatch": ["$CT/"] },
+        "actions": {
+          "baseBlob": { "delete": { "daysAfterModificationGreaterThan": 90 } },
+          "version":  { "delete": { "daysAfterCreationGreaterThan": 30 } }
+        }
+      }
     }
   ]
 }
 EOF
-aws s3api put-bucket-lifecycle-configuration --bucket loom-staging-backups --lifecycle-configuration file://lifecycle.json
-aws s3api get-bucket-lifecycle-configuration  --bucket loom-staging-backups
+az storage account management-policy create --account-name "$SA" -g "$AZ_RG" --policy @lifecycle.json
+az storage account management-policy show   --account-name "$SA" -g "$AZ_RG" -o jsonc
 ```
-- **B2:** Bucket Settings → Lifecycle → custom: "hide after 90 days, delete 1 day after hiding".
-- **R2 / MinIO / others:** an object-expiration rule with *Days = 90* for the whole bucket.
+Azure runs lifecycle policies about once a day, and a new policy can take up to 24–48 hours to start acting.
 
-**TBD-by-R6: how retention is enforced.** R6 keeps 14 daily and 8 weekly backups. With a no-delete key, `rclone` can't prune old backups, so the options are:
-- **(a) Recommended:** R6 writes to `daily/` and `weekly/` prefixes, and the board adds two more lifecycle rules (`daily/` → expire at 15 days, `weekly/` → expire at 60 days). The 90-day rule stays as the safety net. A compromised host can then never delete backups.
-- **(b)** Grant `s3:DeleteObject` so that `rclone` prunes.
+**TBD-by-R6: how retention is enforced.** R6 keeps 14 daily and 8 weekly backups. With a no-delete token, `rclone` can't prune old backups, so the options are:
+- **(a) Recommended:** R6 writes to `daily/` and `weekly/` prefixes, and the board adds two more lifecycle rules (`prefixMatch: ["loom-backups/daily/"]` → delete after 15 days; `["loom-backups/weekly/"]` → delete after 60 days). The 90-day rule stays as the safety net. A compromised host can then never delete backups.
+- **(b)** Add `d` to the stored access policy so that `rclone` prunes.
 
 Until R6 confirms, apply only the 90-day rule. With small alpha dumps, 90 days of dailies costs very little.
 
-### 6.4 Verify the key's scope (from a workstation, with the **backup** key)
+### 6.4 Verify the token's scope (from a workstation, with the **SAS token**, not the account key)
 ```bash
-export AWS_ACCESS_KEY_ID=…  AWS_SECRET_ACCESS_KEY=…  AWS_DEFAULT_REGION=<region>   # type them in, don't paste into chat
-EP="--endpoint-url https://<s3-endpoint>"          # leave empty ("EP=") for AWS
-echo ok | aws s3 cp - s3://loom-staging-backups/setup-check/ok.txt $EP   # put: must succeed
-aws s3 ls s3://loom-staging-backups/setup-check/ $EP                     # list: must succeed
-aws s3 cp s3://loom-staging-backups/setup-check/ok.txt - $EP             # get: prints "ok"
-aws s3 rm s3://loom-staging-backups/setup-check/ok.txt $EP               # delete: must FAIL (AccessDenied)
-aws s3 ls $EP                                                            # list other buckets: must FAIL
-unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+read -rs SAS; echo                                 # paste the SAS token; not echoed or saved in history
+echo ok > ok.txt
+az storage blob upload   --account-name "$SA" -c "$CT" -n setup-check/ok.txt -f ok.txt --sas-token "$SAS" -o none && echo "put ok"   # must succeed
+az storage blob list     --account-name "$SA" -c "$CT" --prefix setup-check/ --sas-token "$SAS" --query '[].name' -o tsv             # list: prints setup-check/ok.txt
+az storage blob download --account-name "$SA" -c "$CT" -n setup-check/ok.txt -f ok-back.txt --sas-token "$SAS" -o none && cat ok-back.txt   # get: prints "ok"
+az storage blob delete   --account-name "$SA" -c "$CT" -n setup-check/ok.txt --sas-token "$SAS"        # delete: must FAIL (AuthorizationPermissionMismatch)
+az storage container list --account-name "$SA" --sas-token "$SAS"                                       # list containers: must FAIL
+rm -f ok.txt ok-back.txt; unset SAS
 ```
 (The leftover `setup-check/ok.txt` expires under the lifecycle rule.)
 
@@ -541,25 +680,25 @@ unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
 
 The host **never** holds the private key. Backups are encrypted to the public key, and only the board can decrypt them (D-P1.12).
 
-1. On an **offline or trusted admin workstation** (not the staging host), install `age` (`sudo apt install age` / `brew install age` / `winget install FiloSottile.age`), then:
+1. On an **offline or trusted admin workstation** (not the `loom` host), install `age` (`sudo apt install age` / `brew install age` / `winget install FiloSottile.age`), then:
    ```bash
    umask 077
-   age-keygen -o loom-staging-backup.agekey
+   age-keygen -o loom-backup.agekey
    # prints:  Public key: age1…   <- this is the only value you post
-   age-keygen -y loom-staging-backup.agekey   # re-prints the public key at any time
+   age-keygen -y loom-backup.agekey   # re-prints the public key at any time
    ```
 2. Test a round trip:
    ```bash
-   echo "restore-test" | age -r "$(age-keygen -y loom-staging-backup.agekey)" | age -d -i loom-staging-backup.agekey
+   echo "restore-test" | age -r "$(age-keygen -y loom-backup.agekey)" | age -d -i loom-backup.agekey
    # expect: restore-test
    ```
 3. **Store the private key** (the file with `AGE-SECRET-KEY-1…`):
    - in the board password manager (as a file attachment or secure note), **and**
    - one offline copy (an encrypted USB stick or a paper printout in a safe) held by a **second** board member.
-   - Optional: wrap it with a passphrase, `age -p -o loom-staging-backup.agekey.age loom-staging-backup.agekey`, then store the `.age` file instead.
-   - Then delete the plaintext from the workstation: `shred -u loom-staging-backup.agekey` (on macOS, `rm -P`).
-4. **Never** copy the private key to the staging host, a Paperclip comment, a GitHub issue, chat or a screenshot.
-5. Post the `age1…` public key on OBI-56 (§11). R6 commits it to `loom-gitops` staging config, where it's public by design.
+   - Optional: wrap it with a passphrase, `age -p -o loom-backup.agekey.age loom-backup.agekey`, then store the `.age` file instead.
+   - Then delete the plaintext from the workstation: `shred -u loom-backup.agekey` (on macOS, `rm -P`).
+4. **Never** copy the private key to the host, a Paperclip comment, a GitHub issue, chat or a screenshot.
+5. Post the `age1…` public key on OBI-56 (§11). R6 commits it to `loom-gitops` config, where it's public by design.
 
 **TBD-by-R6:** restore-drill procedure with the real key. The recommended approach is to run `staging/restore.sh` from an admin workstation, or on the host with the key streamed on stdin and never written to disk. Follow the R6 runbook when it lands.
 
@@ -571,7 +710,7 @@ The host **never** holds the private key. Backups are encrypted to the public ke
 Pre-requisite (org owner, once): **LoomMud org → Settings → Personal access tokens → Settings**: allow fine-grained personal access tokens. If "require administrator approval" is on, approve the token after step 2.
 
 1. As a board member: **GitHub → Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token.**
-   - **Token name:** `loom-staging-reconcile-status`
+   - **Token name:** `loom-reconcile-status`
    - **Resource owner:** `LoomMud`
    - **Expiration:** the maximum your org allows (for example 366 days). **Put a calendar reminder** two weeks before it expires. When it expires, the reconciler's status posts fail and `staging/reconcile` stops updating.
    - **Repository access:** *Only select repositories* → `LoomMud/loom-gitops`
@@ -586,8 +725,8 @@ Pre-requisite (org owner, once): **LoomMud org → Settings → Personal access 
    curl -fsS -X POST \
      -H "Authorization: Bearer $GH_STATUS_TOKEN" -H "Accept: application/vnd.github+json" \
      https://api.github.com/repos/LoomMud/loom-gitops/statuses/$SHA \
-     -d '{"state":"success","context":"staging/setup-check","description":"board token check"}' | jq -r '.state, .context'
-   # expect: success / staging/setup-check
+     -d '{"state":"success","context":"loom/setup-check","description":"board token check"}' | jq -r '.state, .context'
+   # expect: success / loom/setup-check
    unset GH_STATUS_TOKEN
    ```
    On the token's page, check that the permissions list shows only *Commit statuses: Read and write* and *Metadata: Read-only*.
@@ -609,10 +748,10 @@ Statuses show the token owner's GitHub account as the creator. That's expected. 
 **Fallback (only if the package can't be public):** a **classic** PAT (fine-grained PATs don't work with GHCR) with only the `read:packages` scope and an expiry date, owned by a board member with read access to the package. Log in as the service user so the reconciler's `docker compose pull` uses it:
 ```bash
 read -rs GHCR_TOKEN; echo
-echo "$GHCR_TOKEN" | sudo -u loom-staging env HOME=/var/lib/loom-staging \
+echo "$GHCR_TOKEN" | sudo -u loom env HOME=/var/lib/loom \
   docker login ghcr.io -u <github-username> --password-stdin
 unset GHCR_TOKEN
-sudo chmod 600 /var/lib/loom-staging/.docker/config.json
+sudo chmod 600 /var/lib/loom/.docker/config.json
 ```
 **TBD-by-R6:** R6 may instead read a `GHCR_TOKEN` variable from `secrets.env` and log in during reconcile. If `secrets.env.example` has such a variable, put the token there and skip the `docker login`.
 
@@ -624,28 +763,28 @@ sudo chmod 600 /var/lib/loom-staging/.docker/config.json
 
 ### 9.1 Update the clone
 ```bash
-sudo -u loom-staging git -C /opt/loom-gitops pull --ff-only
+sudo -u loom git -C /opt/loom-gitops pull --ff-only
 ls -l /opt/loom-gitops/staging/        # expect: bootstrap.sh, secrets.env.example, compose.yaml, images.env, runbook …
 ```
 
 ### 9.2 Fill in `secrets.env`
 ```bash
 # Copy the template into place, keeping owner/mode
-sudo install -o root -g loom-staging -m 0640 /opt/loom-gitops/staging/secrets.env.example /etc/loom-staging/secrets.env
+sudo install -o root -g loom -m 0640 /opt/loom-gitops/staging/secrets.env.example /etc/loom/secrets.env
 # Generate the Postgres password (hex, so it needs no URL escaping in DATABASE_URL). Copy it into the password manager.
 openssl rand -hex 24
 # Edit in place. sudoedit keeps owner/mode and leaves no copy in shell history.
-sudoedit /etc/loom-staging/secrets.env
-sudo stat -c '%U:%G %a' /etc/loom-staging/secrets.env      # expect: root:loom-staging 640
+sudoedit /etc/loom/secrets.env
+sudo stat -c '%U:%G %a' /etc/loom/secrets.env      # expect: root:loom 640
 ```
 Expected contents: `NAME=value`, one per line, no spaces around `=`.
-**TBD-by-R6:** the **exact variable names** come from `secrets.env.example`. By design (D-P1.13) they cover:
+**TBD-by-R6:** the **exact variable names** come from `secrets.env.example`. By design (D-P1.13, updated for Azure) they cover:
 - the Postgres password (from `openssl` above);
-- the S3 endpoint, region, bucket, access key ID and secret access key (§6);
+- the Azure storage account name, container name and **container SAS token** (§6.2). Never the storage account key;
 - the GitHub commit-status token (§8.1);
 - a GHCR token, only if §8.2 fell back and R6 reads it from this file.
 
-The **age public key is not a secret** and doesn't go here. R6 keeps it in repo config.
+The **age public key is not a secret** and doesn't go here. R6 keeps it in repo config. No Cloudflare credential is needed on the host (unless the Origin CA / DNS-01 fallback in §5.2 is chosen).
 
 Don't `cat` the file on a shared screen, and don't paste its contents anywhere.
 
@@ -653,7 +792,7 @@ Don't `cat` the file on a shared screen, and don't paste its contents anywhere.
 ```bash
 sudo /opt/loom-gitops/staging/bootstrap.sh
 ```
-**TBD-by-R6:** exact invocation (whether it must run as root via `sudo`, and any flags) and what it prints. By design it installs the reconciler systemd service + timer (every 2 min, `User=loom-staging`), checks `/etc/loom-staging/secrets.env` and its modes, and runs the first reconcile: fast-forward, `cosign verify`, `docker compose pull && up -d`, wait for healthy, and post the `staging/reconcile` status. Follow the R6 runbook if it differs.
+**TBD-by-R6:** exact invocation (whether it must run as root via `sudo`, and any flags) and what it prints. By design it installs the reconciler systemd service + timer (every 2 min, `User=loom`), checks `/etc/loom/secrets.env` and its modes, and runs the first reconcile: fast-forward, `cosign verify`, `docker compose pull && up -d`, wait for healthy, and post the `staging/reconcile` status. Caddy serves `loommud.com` and `www.loommud.com` (**TBD-by-R6:** Caddyfile hostnames and Cloudflare `trusted_proxies`, see Appendix A). Follow the R6 runbook if it differs.
 
 ### 9.4 Verification checklist
 Tick every row. Rows marked (TBD-by-R6) use unit or route names that R6 fixes.
@@ -665,47 +804,51 @@ Tick every row. Rows marked (TBD-by-R6) use unit or route names that R6 fixes.
 | H1 | Docker version | `sudo docker info --format '{{.ServerVersion}}'` | ≥ 24 |
 | H2 | Compose v2 | `docker compose version` | v2+ |
 | H3 | Docker at boot | `systemctl is-enabled docker; systemctl is-active docker` | `enabled` / `active` |
-| H4 | Firewall | `sudo ufw status verbose` | deny incoming; allow 80, 443, 4000; 22 only from admin IPs |
-| H5 | Docker bypass closed | `sudo iptables -S DOCKER-USER` | the §4.3 rules, ending in `-j DROP` |
+| H4 | Firewall | `sudo ufw status verbose` | deny incoming; 4000 open; 80/443 open (Cloudflare ranges only if §4.5 applied); 22 only from admin IPs |
+| H5 | Docker bypass closed | `sudo iptables -S DOCKER-USER` | the §4.3 rules (plus §4.5 `LOOM-CF` jumps), ending in `-j DROP` |
 | H6 | Listening ports | `sudo ss -tlnp` | public: 22, 80, 443, 4000 only (5432/8080/9090/3000 absent or bound to container networks) |
-| H7 | Secrets file | `sudo stat -c '%U:%G %a' /etc/loom-staging /etc/loom-staging/secrets.env` | `root:loom-staging 750` / `root:loom-staging 640` |
+| H7 | Secrets file | `sudo stat -c '%U:%G %a' /etc/loom /etc/loom/secrets.env` | `root:loom 750` / `root:loom 640` |
 | H8 | Containers healthy | `sudo docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'` | `loom`, `caddy`, `postgres` `Up … (healthy)`; `mudlib-sync` exited 0 |
 | H9 | Reconciler timer (TBD-by-R6: unit name) | `systemctl list-timers --all \| grep -i loom` | next run within 2 min |
 | H10 | Reconciler log (TBD-by-R6) | `journalctl -u <reconcile-unit> -n 50 --no-pager` | cosign verified, compose up, status posted |
 | H11 | Time sync | `timedatectl status` | synchronized: yes |
 | H12 | Unattended upgrades | `systemctl is-active unattended-upgrades` | `active` |
+| H13 | Hostname | `hostnamectl --static` | `loom` |
+| H14 | Origin certificate | `echo \| openssl s_client -connect 127.0.0.1:443 -servername loommud.com 2>/dev/null \| openssl x509 -noout -issuer -subject -ext subjectAltName -dates` | issuer Let's Encrypt (or ZeroSSL, or Cloudflare Origin CA if the §5.2 fallback is used); SAN includes `loommud.com` and `www.loommud.com`; valid dates |
 
 **From an admin workstation (outside)**
 
 | # | Check | Command | Expect |
 |---|---|---|---|
-| X1 | DNS | `dig +short A staging.<domain> @1.1.1.1` | `PUBLIC_IPV4` |
-| X2 | Open ports | `for p in 80 443 4000; do nc -vz -w 5 staging.<domain> $p; done` | all succeed |
-| X3 | Closed ports | `for p in 5432 8080 9090 3000 2375; do nc -vz -w 5 staging.<domain> $p; done` | all fail/time out |
-| X4 | SSH restricted | `nc -vz -w 5 staging.<domain> 22` from a **non-admin** network (for example a phone hotspot) | fails/times out |
-| X5 | HTTP→HTTPS | `curl -sSI http://staging.<domain>/ \| head -3` | `308`/`301` to `https://…` |
-| X6 | TLS cert issued | `echo \| openssl s_client -connect staging.<domain>:443 -servername staging.<domain> 2>/dev/null \| openssl x509 -noout -issuer -subject -dates` | issuer Let's Encrypt (or ZeroSSL), subject `staging.<domain>`, valid dates |
-| X7 | HTTPS works (strict) | `curl -sS -o /dev/null -w '%{http_code}\n' https://staging.<domain>/` | `200` (no `-k` needed) |
-| X8 | Metrics not public | `curl -s -o /dev/null -w '%{http_code}\n' https://staging.<domain>/metrics` | `403` or `404`, **not** `200` |
-| X9 | Telnet | `telnet staging.<domain> 4000` | Loom banner / login prompt (quit with `Ctrl-]` then `quit`) |
-| X10 | Web client | open `https://staging.<domain>/` in a browser | web client loads and connects (WSS) |
-| X11 | Reconcile status | `gh api repos/LoomMud/loom-gitops/commits/main/statuses --jq '[.[] \| select(.context=="staging/reconcile")][0] \| .state + " " + .description'` | `success …` |
-| X12 | Backups (after the first nightly run; TBD-by-R6 for a manual trigger) | `aws s3 ls s3://loom-staging-backups --recursive $EP` (backup key) | timestamped `*.age` objects |
+| X1 | DNS | `dig +short A system.loommud.com @1.1.1.1; dig +short A loommud.com @1.1.1.1` | `PUBLIC_IPV4`; then Cloudflare IPs (not `PUBLIC_IPV4`) |
+| X2 | Open ports | `nc -vz -w 5 system.loommud.com 4000; for p in 80 443; do nc -vz -w 5 loommud.com $p; done` | all succeed |
+| X3 | Closed ports | `for p in 5432 8080 9090 3000 2375; do nc -vz -w 5 system.loommud.com $p; done` | all fail/time out |
+| X4 | SSH restricted | `nc -vz -w 5 system.loommud.com 22` from a **non-admin** network (for example a phone hotspot) | fails/times out |
+| X5 | HTTP→HTTPS | `curl -sSI http://loommud.com/ \| grep -iE '^(HTTP\|location\|server)'` | `308`/`301` to `https://loommud.com/…`; `server: cloudflare` |
+| X6 | Edge TLS + Full (strict) works | `curl -sS -o /dev/null -w '%{http_code}\n' https://loommud.com/; curl -sS -o /dev/null -w '%{http_code}\n' https://www.loommud.com/` | `200` (or `301` www→apex), **not** `526`/`525`/`521` |
+| X7 | Proxied | `curl -sI https://loommud.com/ \| grep -i cf-ray` | a `cf-ray:` header |
+| X8 | Metrics not public | `curl -s -o /dev/null -w '%{http_code}\n' https://loommud.com/metrics` | `403` or `404`, **not** `200` |
+| X9 | Telnet | `telnet system.loommud.com 4000` | Loom banner / login prompt (quit with `Ctrl-]` then `quit`) |
+| X10 | Web client | open `https://loommud.com/` in a browser | web client loads and connects (WSS through Cloudflare) |
+| X11 | Origin not reachable around Cloudflare (if §4.5 applied) | `curl -sS --max-time 8 -o /dev/null -w '%{http_code}\n' --resolve loommud.com:443:PUBLIC_IPV4 https://loommud.com/` | `000` (timeout) |
+| X12 | Reconcile status | `gh api repos/LoomMud/loom-gitops/commits/main/statuses --jq '[.[] \| select(.context=="staging/reconcile")][0] \| .state + " " + .description'` | `success …` |
+| X13 | Backups (after the first nightly run; TBD-by-R6 for a manual trigger) | `az storage blob list --account-name <SA> -c loom-backups --sas-token "$SAS" --query '[].name' -o tsv` | timestamped `*.age` blobs |
 
-When every row passes, comment on OBI-56 (hostname/IP only, see §11) that the bootstrap is done. Legolas will then run the OBI-42 evidence (character creation, live `update`, image-bump rollout).
+When every row passes, comment on OBI-56 (hostnames/IP only, see §11) that the bootstrap is done. Legolas will then run the OBI-42 evidence (character creation, live `update`, image-bump rollout).
 
 ---
 
 ## 10. Security reminders
 
-- **Never post secrets** in Paperclip comments, question cards, GitHub issues/PRs, chat or screenshots. That covers the bucket key, GitHub/GHCR tokens, the Postgres password, the age private key, and the contents of `secrets.env`.
-- **The only three values that belong on OBI-56:** the hostname, the public IP and the age **public** key (`age1…`).
-- Secrets live in exactly two places: `/etc/loom-staging/secrets.env` (`root:loom-staging 0640`) on the host, and the board password manager. The age private key lives **only** offline (§7).
+- **Never post secrets** in Paperclip comments, question cards, GitHub issues/PRs, chat or screenshots. That covers the Azure SAS token and storage account key, GitHub/GHCR tokens, the Postgres password, Cloudflare credentials, the age private key, and the contents of `secrets.env`.
+- **The only values that belong on OBI-56:** the hostnames (`system.loommud.com`, `loommud.com`, `www.loommud.com`), the public IP and the age **public** key (`age1…`).
+- Secrets live in exactly two places: `/etc/loom/secrets.env` (`root:loom 0640`) on the host, and the board password manager. The age private key lives **only** offline (§7). The Azure storage account key never leaves the admin workstation / Azure portal.
 - Type secrets with `read -rs` or `sudoedit`, never as command-line arguments (those land in shell history and `ps`).
-- **If something leaks:** revoke it immediately (GitHub token page / bucket key / rotate the Postgres password with `ALTER USER`, then update `secrets.env`), then tell Gandalf on OBI-56 *that* a rotation happened. Don't include the value.
-- **Token expiry:** calendar reminders for the GitHub token (and the GHCR token, if used).
+- **If something leaks:** revoke it immediately (GitHub token page / delete the Azure stored access policy, §6.2 / rotate the Postgres password with `ALTER USER`, then update `secrets.env`), then tell Gandalf on OBI-56 *that* a rotation happened. Don't include the value.
+- **Expiry reminders:** the GitHub token, the Azure SAS stored access policy, and the GHCR token (if used).
+- Keep `system.loommud.com` **DNS only**. Turning its proxy on breaks SSH and telnet.
 - **Don't** add people to the `docker` group, open extra ports, or edit `/opt/loom-gitops` by hand. Changes go through `loom-gitops` PRs.
-- Agents have no SSH, kubeconfig or secrets access to this host, by design. They see only GitHub commit statuses and the public telnet/HTTPS endpoints. If anyone (human or agent) asks for host credentials in a comment, decline.
+- Agents have no SSH, kubeconfig, Cloudflare, Azure or secrets access to this host, by design. They see only GitHub commit statuses and the public telnet/HTTPS endpoints. If anyone (human or agent) asks for host credentials in a comment, decline.
 
 ---
 
@@ -713,12 +856,14 @@ When every row passes, comment on OBI-56 (hostname/IP only, see §11) that the b
 
 When sections 1–8 are done, post a comment like this (and/or answer the question card):
 ```text
-Staging host provisioned (OBI-56 items 1–7).
-- Hostname: staging.<domain>
+Loom host provisioned (OBI-56 items 1–7).
+- Machine: loom
+- Direct (DNS only): system.loommud.com   (SSH admins, telnet :4000)
+- Proxied (Cloudflare, Full strict): loommud.com, www.loommud.com
 - Public IP: <PUBLIC_IPV4>   (IPv6: <PUBLIC_IPV6 or "none">)
 - age public key: age1…
 - GHCR: public | fallback read:packages token installed on host | pending first R5 image
-- Bucket: created, scoped key + 90-day lifecycle (provider: <name>, no secrets)
+- Backups: Azure Blob container created, SAS (rcwl, no delete) + 90-day lifecycle (no secrets)
 - Item 8 (bootstrap): waiting for R6 runbook
 ```
 Nothing else. No keys, tokens, passwords or `secrets.env` contents.
@@ -730,21 +875,28 @@ Nothing else. No keys, tokens, passwords or `secrets.env` contents.
 | # | Item | Guide's working assumption |
 |---|---|---|
 | R6-1 | `bootstrap.sh` invocation, run-as user, flags | `sudo /opt/loom-gitops/staging/bootstrap.sh` |
-| R6-2 | Exact `secrets.env` variable names | from `secrets.env.example` (Postgres password, S3 endpoint/region/bucket/key/secret, status token, optional GHCR token) |
-| R6-3 | Reconciler unit user and names | `User=loom-staging`; file `root:loom-staging 0640`, dir `0750` (CTO decision, supersedes D-P1.13's "root 0600") |
-| R6-4 | Clone path | `/opt/loom-gitops`, owned by `loom-staging` |
+| R6-2 | Exact `secrets.env` variable names | from `secrets.env.example` (Postgres password, Azure storage account/container/SAS token, status token, optional GHCR token) |
+| R6-3 | Reconciler unit user, paths and names | `User=loom`; `/etc/loom/secrets.env` `root:loom 0640`, dir `/etc/loom` `0750` (CTO decision, supersedes D-P1.13's "root 0600" and the earlier `loom-staging` names) |
+| R6-4 | Clone path | `/opt/loom-gitops`, owned by `loom` |
 | R6-5 | cosign: host package or container | host `cosign` installed from Ubuntu universe either way |
-| R6-6 | Backup retention with a no-delete key | recommend `daily/` + `weekly/` prefixes with lifecycle rules; 90-day catch-all |
-| R6-7 | GHCR fallback mechanism | `docker login` as `loom-staging`, or `GHCR_TOKEN` in `secrets.env` |
+| R6-6 | Backup retention with a no-delete token | recommend `daily/` + `weekly/` prefixes with lifecycle rules; 90-day catch-all |
+| R6-7 | GHCR fallback mechanism | `docker login` as `loom`, or `GHCR_TOKEN` in `secrets.env` |
 | R6-8 | Backup schedule vs 04:30 UTC reboot window | backup must not overlap 04:30 UTC |
 | R6-9 | Manual first-backup trigger and real-key restore drill | runbook |
 | R6-10 | IPv6 on Compose networks | off (the `after6.rules` block covers it if turned on) |
 | R6-11 | Extra host prerequisites checked by `bootstrap.sh` | none beyond §2.3 |
+| R6-12 | **Backup target is Azure Blob, not S3** (supersedes D-P1.12's S3 wording) | backup container uses the rclone `azureblob` backend with a container `sas_url`, `no_check_container = true` (the SAS can't create/inspect containers), and never deletes |
+| R6-13 | **Caddy behind Cloudflare** | site addresses `loommud.com` + `www.loommud.com` (www → apex redirect or both served); ACME HTTP-01 (works through the proxy); `trusted_proxies` set to Cloudflare ranges so logs and rate limits see real client IPs; Origin CA certificate only as the §5.2 fallback |
+| R6-14 | **Advertised telnet address** | `system.loommud.com:4000` (Cloudflare can't proxy 4000); any MOTD/web-client text that shows a telnet address must use it |
 
 ## Appendix B: troubleshooting
 
 - **Locked out of SSH:** use the provider's web/serial console, then `sudo ufw allow from <your-ip> to any port 22 proto tcp`, or `sudo ufw disable` temporarily.
-- **Certificate not issued:** check that DNS resolves (X1), that 80 and 443 are open (X2), that the AAAA record is correct or absent (§5), and CAA records (§5). Then `sudo docker logs caddy 2>&1 | grep -i acme`. Let's Encrypt rate-limits repeated failures, so fix the cause before restarting in a loop.
+- **SSH or telnet to `system.loommud.com` hangs:** check that the `system` record is **DNS only** (grey cloud). `dig +short system.loommud.com` must return `PUBLIC_IPV4`, not a Cloudflare IP.
+- **Cloudflare error 526 (invalid origin certificate):** Caddy hasn't got its certificate yet. Check DNS (X1), that 80 reaches the origin through Cloudflare (X2), that **Always Use HTTPS** is off (§5.2), and CAA (§5.4). Then `sudo docker logs caddy 2>&1 | grep -i acme`. Let's Encrypt rate-limits repeated failures, so fix the cause before restarting in a loop. If validation through Cloudflare keeps failing, use the Origin CA fallback (§5.2).
+- **Cloudflare error 521/522 (origin down/unreachable):** Caddy isn't running, or §4.5 blocked Cloudflare (re-run `loom-cloudflare-fw`; check that `curl https://www.cloudflare.com/ips-v4` returns a list).
+- **Redirect loop on `loommud.com`:** the Cloudflare SSL mode is *Flexible*. Set it to **Full (strict)** (§5.2).
 - **`docker compose pull` denied on `ghcr.io/loommud/loom`:** the package isn't public yet (§8.2), or the fallback login is missing or expired.
 - **`staging/reconcile` status missing or failed with 401/403:** the status token has expired or lacks *Commit statuses: write* on `loom-gitops` (§8.1).
-- **Reconcile blocked by "local changes":** someone edited `/opt/loom-gitops`. Run `sudo -u loom-staging git -C /opt/loom-gitops status`, then restore with `sudo -u loom-staging git -C /opt/loom-gitops checkout -- . && sudo -u loom-staging git -C /opt/loom-gitops clean -fd` (this discards local changes; they belong in a PR).
+- **Backups fail with `AuthenticationFailed` / `AuthorizationPermissionMismatch`:** the SAS stored access policy has expired or was deleted, or lacks `c`/`w`/`l` (§6.2). Update the policy expiry; the token value stays the same.
+- **Reconcile blocked by "local changes":** someone edited `/opt/loom-gitops`. Run `sudo -u loom git -C /opt/loom-gitops status`, then restore with `sudo -u loom git -C /opt/loom-gitops checkout -- . && sudo -u loom git -C /opt/loom-gitops clean -fd` (this discards local changes; they belong in a PR).
