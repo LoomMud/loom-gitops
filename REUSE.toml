@@ -1,0 +1,14 @@
+# SPDX-FileCopyrightText: 2026 Oberfield
+# SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+version = 1
+
+[[annotations]]
+path = [".github/**"]
+SPDX-FileCopyrightText = "2026 Oberfield"
+SPDX-License-Identifier = "LicenseRef-Oberfield-Proprietary"
+
+[[annotations]]
+path = ["LICENSES/**"]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Oberfield"
+SPDX-License-Identifier = "LicenseRef-Oberfield-Proprietary"
