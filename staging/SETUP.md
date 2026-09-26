@@ -405,6 +405,20 @@ nc -vz  -w 5 PUBLIC_IPV4 8081     # must FAIL/time out (the DOCKER-USER drop wor
 ```
 Clean up on the host: `sudo docker rm -f fwtest && sudo docker image rm nginx:alpine`.
 
+> **Run both `nc` tests from your workstation, not from the host.** A connection from the host to its own public IP goes through `OUTPUT`/loopback and `docker-proxy`. It never crosses `FORWARD` from `${EXT_IF}`, so it succeeds even when the provider firewall or `DOCKER-USER` blocks outside traffic. It proves only that the container is listening.
+
+**If 4000 times out from the workstation**, find out where the SYN dies. On the host:
+```bash
+EXT_IF=$(ip -o -4 route show to default | awk '{print $5; exit}')
+sudo iptables -Z DOCKER-USER                      # zero the counters
+sudo timeout 20 tcpdump -ni "$EXT_IF" 'tcp port 4000 and tcp[tcpflags] & tcp-syn != 0'
+# ...while that runs, repeat `nc -vz -w 5 PUBLIC_IPV4 4000` from the workstation...
+sudo iptables -L DOCKER-USER -v -n --line-numbers
+```
+- **tcpdump shows no SYN from your workstation's IP:** the packet is being dropped *before* it reaches the VM. This is the provider firewall (§1.1), not ufw or Docker. Open TCP 4000 there. On IONOS, go to Cloud Panel → Network → Firewall Policies, add an inbound TCP 4000 rule to the policy assigned to the server, and wait for it to apply. IONOS's default policy opens only a few well-known ports (22/80/443 and a few others), not 4000.
+- **SYN is seen and the `DROP` rule's counter goes up:** the `DOCKER-USER` allow rules aren't matching. Check that `sudo iptables -S DOCKER-USER` shows the real interface name, not an empty `! -i  -j RETURN`. Check that the `--ctorigdstport 4000` rule comes before `-j DROP`. Also check that `sudo iptables -S FORWARD` jumps to `DOCKER-USER` first.
+- **SYN is seen and nothing is dropped, but there's still no reply:** check `sudo docker ps` for `0.0.0.0:4000->…`. Also run `sudo iptables -t nat -S DOCKER | grep 4000`.
+
 ### 4.4 Outbound
 Leave outbound open (`ufw default allow outgoing`). GitHub, GHCR and ACME are served from rotating CDN IPs, so pinning egress by IP is fragile and not worth the risk for staging. If your provider **does** filter egress, allow these:
 
