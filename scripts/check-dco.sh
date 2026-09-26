@@ -15,7 +15,7 @@ failed=0
 for c in $commits; do
   author_name=$(git show -s --format='%an' "$c")
   author_email=$(git show -s --format='%ae' "$c")
-  trailer=$(git show -s --format='%(trailers:key=Signed-off-by,valueonly)' "$c" | tail -n1)
+  trailer=$(git show -s --format='%(trailers:key=Signed-off-by,valueonly)' "$c" | sed '/^$/d' | tail -n1)
 
   if [[ -z "$trailer" ]]; then
     echo "Missing Signed-off-by trailer: $c"
