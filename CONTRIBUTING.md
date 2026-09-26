@@ -9,7 +9,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 
 This repository is public and licensed under the **GNU Affero General Public License v3.0 only**
 (`AGPL-3.0-only`). The full text is in [`LICENSE`](LICENSE) (REUSE copy: `LICENSES/AGPL-3.0-only.txt`).
-Every file carries `SPDX-License-Identifier: AGPL-3.0-only`.
+Every file carries an SPDX header naming `AGPL-3.0-only` as its licence identifier.
 
 **External pull requests are not accepted for now.** Please do not open pull requests from forks; they
 will be closed unmerged. Issues, bug reports and feedback are welcome. We will revisit this (most likely
