@@ -1,5 +1,0 @@
-SPDX-FileCopyrightText: 2026 Oberfield
-SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
-
-This project is proprietary during development.
-All rights reserved.
