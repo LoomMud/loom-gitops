@@ -1,16 +1,19 @@
 <!--
 SPDX-FileCopyrightText: 2026 Oberfield
-SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+SPDX-License-Identifier: AGPL-3.0-only
 -->
 
 # Contributing to loom-gitops
 
 ## Status and licence
 
-This repository is **public but not open source (yet)**. The project licence is still being decided, so
-every file is `LicenseRef-Oberfield-Proprietary` (all rights reserved). **External contributions are not
-accepted** until a licence is chosen; please do not open pull requests from forks. Issues and feedback
-are welcome.
+This repository is public and licensed under the **GNU Affero General Public License v3.0 only**
+(`AGPL-3.0-only`). The full text is in [`LICENSE`](LICENSE) (REUSE copy: `LICENSES/AGPL-3.0-only.txt`).
+Every file carries `SPDX-License-Identifier: AGPL-3.0-only`.
+
+**External pull requests are not accepted for now.** Please do not open pull requests from forks; they
+will be closed unmerged. Issues, bug reports and feedback are welcome. We will revisit this (most likely
+accepting contributions under AGPL-3.0-only with DCO sign-off) once the contribution governance is settled.
 
 ## Rules
 
