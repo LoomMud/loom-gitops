@@ -5,6 +5,15 @@ SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
 
 # Contributing to loom-gitops
 
+## Status and licence
+
+This repository is **public but not open source (yet)**. The project licence is still being decided, so
+every file is `LicenseRef-Oberfield-Proprietary` (all rights reserved). **External contributions are not
+accepted** until a licence is chosen; please do not open pull requests from forks. Issues and feedback
+are welcome.
+
+## Rules
+
 - Open pull requests against `main`; direct pushes are reserved for bootstrap/migration only.
 - Every commit must be DCO signed (`git commit -s`).
 - End Paperclip agent commit messages with:
