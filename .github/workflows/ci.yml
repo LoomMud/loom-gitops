@@ -50,3 +50,69 @@ jobs:
           tar -xzf "$workdir/gitleaks.tar.gz" -C "$workdir" gitleaks
           "$workdir/gitleaks" git --redact --exit-code 1 .
       - uses: fsfe/reuse-action@v5
+
+  # Renders and partially boots the R6 (OBI-42) staging stack. This repo's
+  # dev sandbox has neither docker nor cargo, so this job -- not a local
+  # run -- is the real evidence that staging/compose.yaml is well-formed
+  # and that the pieces that don't need a private GHCR pull actually come
+  # up healthy. It cannot boot `loom`/`caddy` (private image, real TLS
+  # domain) or exercise the digest-bump/persistence drill; that needs
+  # either a public GHCR package (OBI-109) or the real host (OBI-106).
+  compose-validate:
+    runs-on: ${{ (vars.CI_RUNS_ON && !github.event.pull_request.head.repo.fork) && (startsWith(vars.CI_RUNS_ON, '[') && fromJSON(vars.CI_RUNS_ON) || vars.CI_RUNS_ON) || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: shellcheck staging scripts
+        run: |
+          set -euo pipefail
+          shellcheck staging/*.sh
+      - name: render full compose config (no image pull)
+        env:
+          POSTGRES_PASSWORD: ci-throwaway-password
+        run: |
+          set -euo pipefail
+          docker compose \
+            --env-file staging/images.env \
+            -f staging/compose.yaml config >/dev/null
+      - name: validate Caddyfile
+        run: |
+          set -euo pipefail
+          . staging/images.env
+          docker run --rm \
+            -v "$PWD/staging/Caddyfile:/etc/caddy/Caddyfile:ro" \
+            "$CADDY_IMAGE" caddy validate --config /etc/caddy/Caddyfile
+      - name: boot postgres + mudlib-sync, twice (D-P1.11 idempotency)
+        env:
+          POSTGRES_PASSWORD: ci-throwaway-password
+        run: |
+          set -euo pipefail
+          compose() {
+            docker compose --env-file staging/images.env -f staging/compose.yaml "$@"
+          }
+          compose up -d postgres mudlib-sync
+          for i in $(seq 1 30); do
+            status=$(docker inspect -f '{{.State.Health.Status}}' "$(compose ps -q postgres)")
+            [ "$status" = healthy ] && break
+            sleep 2
+          done
+          [ "$status" = healthy ] || { echo "postgres never became healthy"; compose logs postgres; exit 1; }
+          [ "$(docker inspect -f '{{.State.ExitCode}}' "$(compose ps -a -q mudlib-sync)")" = 0 ] || { compose logs mudlib-sync; exit 1; }
+          # mudlib-sync deletes /mudlib/.git after checkout (compose.yaml), so verify by
+          # file count instead of `git log`.
+          echo "mudlib-sync run 1: volume has $(docker run --rm -v loom_mudlib:/m alpine sh -c 'find /m -type f | wc -l') files"
+          # Second run must be a no-op reset (same WARP_REF): compare volume content hash before/after.
+          before=$(docker run --rm -v loom_mudlib:/m alpine sh -c 'find /m -type f | sort | xargs -r sha256sum' | sha256sum)
+          compose up -d mudlib-sync
+          for i in $(seq 1 15); do
+            [ "$(docker inspect -f '{{.State.Status}}' "$(compose ps -a -q mudlib-sync)")" = exited ] && break
+            sleep 1
+          done
+          after=$(docker run --rm -v loom_mudlib:/m alpine sh -c 'find /m -type f | sort | xargs -r sha256sum' | sha256sum)
+          [ "$before" = "$after" ] || { echo "mudlib-sync reset the volume on a no-op re-run (D-P1.11 violated)"; exit 1; }
+          echo "D-P1.11 idempotency check passed: second mudlib-sync run at the same WARP_REF made no changes"
+          compose down -v
+      - name: attempt loom image pull (informational; expected to fail until OBI-109 makes it public)
+        continue-on-error: true
+        run: |
+          . staging/images.env
+          docker pull "$LOOM_IMAGE" && echo "LOOM_IMAGE is pullable" || echo "LOOM_IMAGE pull failed (expected while GHCR package is private, OBI-109)"
