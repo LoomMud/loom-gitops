@@ -16,7 +16,14 @@ SPDX-License-Identifier: AGPL-3.0-only
 
 Items marked **TBD-by-R6** depend on files R6 (OBI-42) has not shipped yet. Do not guess them. Skip that step until the repo has the file, or ask on OBI-42.
 
-### What changed in this revision (OBI-62)
+### What changed in this revision (OBI-106)
+- **Agents now have SSH access.** This is a board decision (OBI-58) that reverses the earlier "agents have no SSH" rule (OBI-8 §3.4 / OBI-56). A dedicated `loom-agent` account with passwordless sudo lets Paperclip agents run §1–§5 and §9 themselves. The access model, and how to revoke it with one line, is in the new **§3.6**.
+- **Steady state is unchanged.** Deploys still go only through reviewed `loom-gitops` PRs, the reconciler and cosign verification. Agent SSH is for provisioning and break-glass work, not for day-to-day deploys.
+- **SSH allow-list:** board admin IPs **plus the Paperclip egress IP** (§4.2).
+- **`secrets.env` variable names** are now fixed in `staging/secrets.env.example` (CTO decision; R6 must use them). §9.2 names the exact line where the board pastes the GitHub token.
+- **Firewall markers:** the ufw `after.rules` markers are now `LOOM …`; the old `LOOM-STAGING …` markers are gone.
+
+### Previous revision (OBI-62)
 - Machine name `loom`. Service user `loom` (was `loom-staging`). Secrets directory `/etc/loom` (was `/etc/loom-staging`). No "staging" in any user or DNS name.
 - DNS: `system.loommud.com` (DNS only, direct: SSH and telnet) plus `loommud.com` / `www.loommud.com` (Cloudflare-proxied: HTTPS and WSS). New §5 covers Cloudflare settings; §4.5 limits 80/443 to Cloudflare; §9 checks updated.
 - Backups: Azure Blob Storage with a container-scoped SAS token and an Azure lifecycle policy, instead of AWS/S3 (§6).
@@ -277,7 +284,7 @@ PermitEmptyPasswords no
 X11Forwarding no
 MaxAuthTries 3
 LoginGraceTime 30
-# Only sudo-group accounts (the board admins) may log in over SSH
+# Only sudo-group accounts (the board admins + loom-agent, §3.6) may log in over SSH
 AllowGroups sudo
 EOF
 sudo sshd -t && sudo systemctl restart ssh
@@ -311,7 +318,7 @@ id loom                    # expect: groups include loom and docker
 
 > **Caveat: `docker` group = root.** Any member of the `docker` group can start a privileged container that mounts `/` and so gets full root on the host. `loom` needs this, because the reconciler runs `docker compose`. The account is safe only because:
 > - it has no password and no login shell, and SSH is limited to the `sudo` group (§3.2);
-> - nothing agent-controlled can reach it. Agents influence the host only through reviewed PRs to `loom-gitops`, and every image digest is cosign-verified before it runs (D-P1.8);
+> - in the steady state, agents change what runs on the host only through reviewed PRs to `loom-gitops`, and every image digest is cosign-verified before it runs (D-P1.8). The `loom-agent` account (§3.6) is root-equivalent by design. It exists for provisioning and break-glass work, is sudo-logged, and can be revoked in one line;
 > - admins do **not** join `docker`. They use `sudo docker`, so root-level actions stay explicit and logged by sudo.
 >
 > Rootless Docker was considered and rejected for Phase 1: it complicates binding ports 80/443, plus systemd user sessions and reconciler ergonomics. This will be revisited with the Phase 2+ Flux move.
@@ -342,6 +349,44 @@ sudo -u loom git -C /opt/loom-gitops log --oneline -1
 - **Never edit files in this clone by hand.** Changes go through PRs. The reconciler fast-forwards, and local edits would block it.
 - **TBD-by-R6:** if `bootstrap.sh` expects a different clone path, follow the runbook and tell the CTO so this guide gets updated.
 
+### 3.6 Agent access: `loom-agent` (OBI-58 / OBI-106)
+The board lets Paperclip agents configure the host directly over SSH. The access is deliberately narrow and easy to revoke.
+
+| What | Value |
+|---|---|
+| Account | `loom-agent` (uid ≥ 1000, `--disabled-password`, member of `sudo` so that `AllowGroups sudo` admits it) |
+| Auth | one ed25519 public key in `/home/loom-agent/.ssh/authorized_keys`, comment `paperclip-agents@system.loommud.com`, fingerprint `SHA256:qtzsOjovNZhtip1wHAdzGFDlPsNjlHdL7uPUBKklk3Q` |
+| Private key | only in Paperclip, as secret `infra/system.loommud.com/ssh-private-key`. It's bound to **Aragorn (CTO)** as `access.system_loommud_ssh_key`, fetched on demand through the API and never injected into the environment. Each run writes it to a `0600` file in its scratch directory and deletes it afterwards. It's never printed, committed or posted. |
+| sudo | `/etc/sudoers.d/loom-agent`: `loom-agent ALL=(ALL) NOPASSWD:ALL`, mode `0440`. Agents can't answer password prompts. |
+| Network | port 22 is allowed from the board admin IPs **and the Paperclip egress IP** (§4.2) |
+| Host key pin | `ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGV9ZR6qug6DJuozl4ZkxrOjXSBZApoDMLAoYX6adtUA` (`SHA256:fAPB5XV1cCFMvPMGY4T3VJjoPN+3DqAi278je//De3s`). Agents connect with `StrictHostKeyChecking=yes` against this pin. |
+| Who has SSH | the board admins (named accounts, §3.1) and Paperclip agents through `loom-agent`. Nobody else. |
+
+Set it up once, as a board admin:
+```bash
+sudo adduser --disabled-password --comment "Paperclip agents" loom-agent
+sudo usermod -aG sudo loom-agent                    # required: sshd has AllowGroups sudo (§3.2)
+sudo install -d -m 0700 -o loom-agent -g loom-agent /home/loom-agent/.ssh
+printf '%s\n' 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHOehHwgKrVYB+mA+MP167DDO2gxHDwv9V2aYHBVLOLU paperclip-agents@system.loommud.com' \
+  | sudo tee /home/loom-agent/.ssh/authorized_keys >/dev/null
+sudo chown loom-agent:loom-agent /home/loom-agent/.ssh/authorized_keys && sudo chmod 0600 /home/loom-agent/.ssh/authorized_keys
+echo 'loom-agent ALL=(ALL) NOPASSWD:ALL' | sudo tee /etc/sudoers.d/loom-agent >/dev/null
+sudo chmod 0440 /etc/sudoers.d/loom-agent && sudo visudo -c
+```
+> **Pitfall (hit on OBI-106):** without `usermod -aG sudo`, sshd rejects the key with a bare `Permission denied (publickey)`. The key file looks fine, but `AllowGroups sudo` filters the user out before any key is checked.
+
+**Revoke agent access** (any board admin, takes effect immediately; no restart needed):
+```bash
+sudo sed -i '/paperclip-agents@system.loommud.com/d' /home/loom-agent/.ssh/authorized_keys   # the one-line revoke
+# Optional, for a full removal:
+sudo gpasswd -d loom-agent sudo; sudo rm -f /etc/sudoers.d/loom-agent; sudo deluser --remove-home loom-agent
+```
+After revoking, also ask Gandalf to archive the Paperclip secret. To rotate the key, generate a new pair, replace the line, and update the Paperclip secret.
+
+**Audit:** every agent command goes through `sudo`, so `sudo journalctl _COMM=sudo --since today` and `journalctl -u ssh | grep loom-agent` show what ran and when. Agents also post a summary of every change on the Paperclip issue.
+
+**Steady state is still GitOps + cosign.** Agents use SSH for host provisioning, one-off bootstrap (§9) and break-glass debugging. What runs in the stack still changes **only** through reviewed `loom-gitops` PRs, the reconciler and `cosign verify`. Agents don't hand-edit `/opt/loom-gitops`, run images outside Compose, or read `secrets.env` values into comments.
+
 ---
 
 ## 4. Firewall & network
@@ -362,6 +407,8 @@ sudo ufw default deny routed
 
 # SSH: board admin source IPs only (repeat for each admin IP/CIDR)
 sudo ufw allow from 198.51.100.7/32 to any port 22 proto tcp comment 'ssh board-admin'
+# ...plus the Paperclip egress IP, for loom-agent (§3.6). It was 167.254.58.3 as of 2026-09-27; confirm it with the board, since it may change.
+sudo ufw allow from 167.254.58.3/32 to any port 22 proto tcp comment 'ssh paperclip-agents'
 # sudo ufw allow from 2001:db8:abcd::/48 to any port 22 proto tcp comment 'ssh board-admin v6'
 
 # Public services
@@ -778,7 +825,10 @@ sudoedit /etc/loom/secrets.env
 sudo stat -c '%U:%G %a' /etc/loom/secrets.env      # expect: root:loom 640
 ```
 Expected contents: `NAME=value`, one per line, no spaces around `=`.
-**TBD-by-R6:** the **exact variable names** come from `secrets.env.example`. By design (D-P1.13, updated for Azure) they cover:
+
+**On `system.loommud.com` this is already done (OBI-106).** The file has the `secrets.env.example` layout, and `POSTGRES_PASSWORD` was generated on the host (48 hex characters; to copy it into the password manager, use `sudo grep ^POSTGRES_PASSWORD= /etc/loom/secrets.env` in your own session). **The only board step left is the GitHub token.** Run `sudoedit /etc/loom/secrets.env` and replace `REPLACE_WITH_GITHUB_PAT` on **line 8** (`GITHUB_STATUS_TOKEN=…`) with the §8.1 token. Leave the backup lines commented out until §6 and §7 are done.
+
+The **variable names** are fixed in `staging/secrets.env.example` (CTO decision, OBI-106; R6 must use them). By design (D-P1.13, updated for Azure) they cover:
 - the Postgres password (from `openssl` above);
 - the Azure storage account name, container name and **container SAS token** (§6.2). Never the storage account key;
 - the GitHub commit-status token (§8.1);
@@ -848,7 +898,7 @@ When every row passes, comment on OBI-56 (hostnames/IP only, see §11) that the 
 - **Expiry reminders:** the GitHub token, the Azure SAS stored access policy, and the GHCR token (if used).
 - Keep `system.loommud.com` **DNS only**. Turning its proxy on breaks SSH and telnet.
 - **Don't** add people to the `docker` group, open extra ports, or edit `/opt/loom-gitops` by hand. Changes go through `loom-gitops` PRs.
-- Agents have no SSH, kubeconfig, Cloudflare, Azure or secrets access to this host, by design. They see only GitHub commit statuses and the public telnet/HTTPS endpoints. If anyone (human or agent) asks for host credentials in a comment, decline.
+- **Agent access is limited to one SSH key for `loom-agent` (§3.6).** Agents have no Cloudflare, Azure or GitHub-token access, and they never ask for secrets in comments. If a secret is needed on the host, a board member puts it there over their own SSH session, or creates a Paperclip secret. If anyone (human or agent) asks for a credential in a comment, decline. To cut agents off, delete the `authorized_keys` line (§3.6).
 
 ---
 
@@ -875,7 +925,7 @@ Nothing else. No keys, tokens, passwords or `secrets.env` contents.
 | # | Item | Guide's working assumption |
 |---|---|---|
 | R6-1 | `bootstrap.sh` invocation, run-as user, flags | `sudo /opt/loom-gitops/staging/bootstrap.sh` |
-| R6-2 | Exact `secrets.env` variable names | from `secrets.env.example` (Postgres password, Azure storage account/container/SAS token, status token, optional GHCR token) |
+| R6-2 | Exact `secrets.env` variable names | **Fixed (OBI-106):** `POSTGRES_PASSWORD`, `GITHUB_STATUS_TOKEN`, `AZURE_STORAGE_ACCOUNT`, `AZURE_STORAGE_CONTAINER`, `AZURE_STORAGE_SAS_TOKEN`, optional `GHCR_TOKEN` (see `staging/secrets.env.example`). If R6 needs a rename, change the example file and the host file in the same PR/run. |
 | R6-3 | Reconciler unit user, paths and names | `User=loom`; `/etc/loom/secrets.env` `root:loom 0640`, dir `/etc/loom` `0750` (CTO decision, supersedes D-P1.13's "root 0600" and the earlier `loom-staging` names) |
 | R6-4 | Clone path | `/opt/loom-gitops`, owned by `loom` |
 | R6-5 | cosign: host package or container | host `cosign` installed from Ubuntu universe either way |
@@ -892,6 +942,8 @@ Nothing else. No keys, tokens, passwords or `secrets.env` contents.
 ## Appendix B: troubleshooting
 
 - **Locked out of SSH:** use the provider's web/serial console, then `sudo ufw allow from <your-ip> to any port 22 proto tcp`, or `sudo ufw disable` temporarily.
+- **Agent SSH (`loom-agent`) times out, but admin SSH works:** the Paperclip egress IP has probably changed. Ask an agent to post its current egress IP (`curl -s https://ifconfig.me`), then `sudo ufw allow from <new-ip>/32 to any port 22 proto tcp comment 'ssh paperclip-agents'` and delete the old rule (`sudo ufw status numbered`, then `sudo ufw delete <n>`).
+- **Agent SSH gives `Permission denied (publickey)`:** check that `loom-agent` is in the `sudo` group (`id loom-agent`), because `AllowGroups sudo` applies (§3.6). Then check the `authorized_keys` line and its modes.
 - **SSH or telnet to `system.loommud.com` hangs:** check that the `system` record is **DNS only** (grey cloud). `dig +short system.loommud.com` must return `PUBLIC_IPV4`, not a Cloudflare IP.
 - **Cloudflare error 526 (invalid origin certificate):** Caddy hasn't got its certificate yet. Check DNS (X1), that 80 reaches the origin through Cloudflare (X2), that **Always Use HTTPS** is off (§5.2), and CAA (§5.4). Then `sudo docker logs caddy 2>&1 | grep -i acme`. Let's Encrypt rate-limits repeated failures, so fix the cause before restarting in a loop. If validation through Cloudflare keeps failing, use the Origin CA fallback (§5.2).
 - **Cloudflare error 521/522 (origin down/unreachable):** Caddy isn't running, or §4.5 blocked Cloudflare (re-run `loom-cloudflare-fw`; check that `curl https://www.cloudflare.com/ips-v4` returns a list).
