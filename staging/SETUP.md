@@ -19,7 +19,8 @@ Items marked **TBD-by-R6** depend on files R6 (OBI-42) has not shipped yet. Do n
 ### What changed in this revision (OBI-106)
 - **Agents now have SSH access.** This is a board decision (OBI-58) that reverses the earlier "agents have no SSH" rule (OBI-8 §3.4 / OBI-56). A dedicated `loom-agent` account with passwordless sudo lets Paperclip agents run §1–§5 and §9 themselves. The access model, and how to revoke it with one line, is in the new **§3.6**.
 - **Steady state is unchanged.** Deploys still go only through reviewed `loom-gitops` PRs, the reconciler and cosign verification. Agent SSH is for provisioning and break-glass work, not for day-to-day deploys.
-- **SSH allow-list:** board admin IPs **plus the Paperclip egress IP** (§4.2).
+- **SSH:** the intended allow-list is board admin IPs **plus the Paperclip egress IP** (§4.2). On `system.loommud.com`, the board kept 22 open instead, because that IP is dynamic, and added fail2ban.
+- **Admins aren't in the `docker` group** (§3.1). `greg` was removed on OBI-106 and uses `sudo docker`.
 - **`secrets.env` variable names** are now fixed in `staging/secrets.env.example` (CTO decision; R6 must use them). §9.2 names the exact line where the board pastes the GitHub token.
 - **Firewall markers:** the ufw `after.rules` markers are now `LOOM …`; the old `LOOM-STAGING …` markers are gone.
 
@@ -233,6 +234,7 @@ sudo apt install -y \
 | `jq`, `curl` | reconciler posts the GitHub commit status; verification commands; Cloudflare IP list (§4.5) |
 | `openssl` | generates the Postgres password; TLS checks |
 | `dnsutils`, `netcat-openbsd`, `telnet` | DNS, port and telnet verification (§5, §9) |
+| `fail2ban` | bans SSH brute-force sources, since 22 stays open (§4.2, OBI-106) |
 | `cosign` | the reconciler verifies image signatures before deploying (D-P1.8). Ubuntu 26.04 universe ships cosign 2.x. **TBD-by-R6:** R6 may run cosign from a pinned container instead. Installing the package is harmless either way. |
 
 The Azure CLI is **not** needed on the host. Backups upload from inside the `backup` container with `rclone` (Azure Blob backend) and a SAS token (§6).
@@ -422,6 +424,30 @@ sudo ufw status verbose
 ```
 Check SSH from a new terminal **before** you close the old one.
 If admin IPs change often, use a VPN/Tailscale range as `ADMIN_SRC_IPS` rather than opening 22 to the world.
+
+**`system.loommud.com` as built (board decision, OBI-106):** the admin and Paperclip egress IP is dynamic, so **22 stays open to Anywhere** (`sudo ufw allow 22/tcp`). It's protected by key-only auth, `AllowGroups sudo` and **fail2ban**. X4 in §9.4 is a documented exception. Install fail2ban like this:
+```bash
+sudo apt install -y fail2ban
+sudo tee /etc/fail2ban/jail.d/loom-sshd.local >/dev/null <<'EOF'
+[DEFAULT]
+# board admin + Paperclip egress (dynamic; update if it changes)
+ignoreip = 127.0.0.1/8 ::1 167.254.58.3
+banaction = ufw
+backend = systemd
+
+[sshd]
+enabled  = true
+mode     = aggressive
+maxretry = 5
+findtime = 10m
+bantime  = 1h
+bantime.increment = true
+bantime.maxtime   = 1w
+EOF
+sudo fail2ban-client -t && sudo systemctl enable --now fail2ban && sudo systemctl restart fail2ban
+sudo fail2ban-client status sshd
+```
+If you get banned from a new IP, use the IONOS console: `sudo fail2ban-client set sshd unbanip <ip>`, then add the IP to `ignoreip`.
 
 ### 4.3 Docker bypasses ufw: fix it with `DOCKER-USER`
 **The problem:** ports published by Docker (`ports:` in Compose) are DNAT-ed in the `nat` table and forwarded through the `FORWARD` chain. They never reach ufw's `INPUT` rules. So **any** published port is reachable from the internet, whatever `ufw status` says. Compose will publish only 80, 443 and 4000 (D-P1.14), but one wrong `ports:` line in a future PR (say `5432:5432`) would expose Postgres.
@@ -873,7 +899,7 @@ Tick every row. Rows marked (TBD-by-R6) use unit or route names that R6 fixes.
 | X1 | DNS | `dig +short A system.loommud.com @1.1.1.1; dig +short A loommud.com @1.1.1.1` | `PUBLIC_IPV4`; then Cloudflare IPs (not `PUBLIC_IPV4`) |
 | X2 | Open ports | `nc -vz -w 5 system.loommud.com 4000; for p in 80 443; do nc -vz -w 5 loommud.com $p; done` | all succeed |
 | X3 | Closed ports | `for p in 5432 8080 9090 3000 2375; do nc -vz -w 5 system.loommud.com $p; done` | all fail/time out |
-| X4 | SSH restricted | `nc -vz -w 5 system.loommud.com 22` from a **non-admin** network (for example a phone hotspot) | fails/times out |
+| X4 | SSH restricted | `nc -vz -w 5 system.loommud.com 22` from a **non-admin** network (for example a phone hotspot) | fails/times out. **Exception on `system.loommud.com`:** 22 stays open by board decision (dynamic IP); instead check `sudo fail2ban-client status sshd` shows the jail active. |
 | X5 | HTTP→HTTPS | `curl -sSI http://loommud.com/ \| grep -iE '^(HTTP\|location\|server)'` | `308`/`301` to `https://loommud.com/…`; `server: cloudflare` |
 | X6 | Edge TLS + Full (strict) works | `curl -sS -o /dev/null -w '%{http_code}\n' https://loommud.com/; curl -sS -o /dev/null -w '%{http_code}\n' https://www.loommud.com/` | `200` (or `301` www→apex), **not** `526`/`525`/`521` |
 | X7 | Proxied | `curl -sI https://loommud.com/ \| grep -i cf-ray` | a `cf-ray:` header |
