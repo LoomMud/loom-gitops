@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: 2026 Oberfield
+# SPDX-License-Identifier: AGPL-3.0-only
+
+apiVersion: 1
+
+providers:
+  - name: Loom Staging
+    orgId: 1
+    folder: Loom
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards

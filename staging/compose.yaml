@@ -1,0 +1,197 @@
+# SPDX-FileCopyrightText: 2026 Oberfield
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Docker Compose staging stack (R6, OBI-42; plan r4 §3.4, decisions
+# D-P1.7-D-P1.14). Declared here, reconciled onto the host by
+# staging/reconcile.sh + a systemd timer. Every image is pinned by digest
+# in staging/images.env -- there are no floating tags in this file.
+#
+# Kept Flux-friendly per plan §3.4.3: one Kustomize-shaped directory
+# (`staging/`), no host-path bind mounts outside `staging/` itself, all
+# config through images.env + secrets.env (a straightforward drop-in
+# replacement for a Flux `ConfigMapGenerator`/SOPS-decrypted Secret later),
+# named volumes only, and services split one-per-concern so each maps
+# cleanly onto a future Deployment/StatefulSet/CronJob (see the PR
+# description checklist for the full review).
+
+name: loom
+
+services:
+  loom:
+    image: ${LOOM_IMAGE}
+    restart: unless-stopped
+    stop_grace_period: 30s
+    command: ["serve", "--mudlib", "/mudlib"]
+    environment:
+      LOOM_TELNET_ADDR: 0.0.0.0:4000
+      DATABASE_URL: postgres://loom:${POSTGRES_PASSWORD}@postgres:5432/loom
+    volumes:
+      - mudlib:/mudlib:ro
+    ports:
+      # Telnet: published directly (D-P1.14), not proxied by Caddy or
+      # Cloudflare (SETUP.md §5.3).
+      - "4000:4000"
+    # HTTP :8080 (health/ready/metrics/WS/web client) is internal-only:
+    # no `ports:` entry, reached by `caddy` over the compose network only.
+    expose:
+      - "8080"
+    healthcheck:
+      # TODO(R6 follow-up, tracked on OBI-42): the pinned LOOM_IMAGE
+      # (v0.1.0-alpha.0) predates `loom probe` (loom#42) and loom-http's
+      # `:8080` (/healthz, /readyz) doesn't exist yet, so there is no
+      # HTTP client and no HTTP endpoint to probe today. This uses bash's
+      # `/dev/tcp` (bash ships in debian:bookworm-slim) as a bare
+      # TCP-listening check on the telnet port. Once a LOOM_IMAGE digest
+      # bump picks up `loom probe` and loom-http ships `/healthz`, switch
+      # this to `["CMD", "/usr/local/bin/loom", "probe", "http://127.0.0.1:8080/healthz"]`
+      # (no bash dependency, checks readiness, not just "a socket is open").
+      test: ["CMD-SHELL", "bash -c '(exec 3<>/dev/tcp/127.0.0.1/4000) 2>/dev/null'"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mudlib-sync:
+        condition: service_completed_successfully
+
+  caddy:
+    image: ${CADDY_IMAGE}
+    restart: unless-stopped
+    stop_grace_period: 30s
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    healthcheck:
+      test: ["CMD", "caddy", "validate", "--config", "/etc/caddy/Caddyfile"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    depends_on:
+      loom:
+        condition: service_healthy
+
+  postgres:
+    image: ${POSTGRES_IMAGE}
+    restart: unless-stopped
+    stop_grace_period: 30s
+    # Internal only: no `ports:` entry. Reachable from `loom` and `backup`
+    # over the compose network, never published to the host.
+    environment:
+      POSTGRES_USER: loom
+      POSTGRES_DB: loom
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U loom -d loom"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # One-shot: checks out LoomMud/warp at WARP_REF into the `mudlib` volume
+  # (D-P1.11). Exits 0 on success; `loom` and `caddy` wait for that via
+  # `depends_on: ... condition: service_completed_successfully`. Re-runs
+  # (and container-recreates) only when WARP_REF or WARP_REPO changes,
+  # because those are baked into its environment (part of the container's
+  # config hash that `docker compose up` diffs). The script itself is
+  # idempotent even if run again unprompted: it resets the volume only
+  # when the checked-out commit doesn't already match WARP_REF.
+  mudlib-sync:
+    image: ${GIT_SYNC_IMAGE}
+    restart: "no"
+    environment:
+      WARP_REPO: ${WARP_REPO}
+      WARP_REF: ${WARP_REF}
+    volumes:
+      - mudlib:/mudlib
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        echo "mudlib-sync: target ${WARP_REPO} @ ${WARP_REF}"
+        current=""
+        if [ -d /mudlib/.git ]; then
+          current=$$(git -C /mudlib rev-parse HEAD 2>/dev/null || echo "")
+        fi
+        if [ "$$current" = "${WARP_REF}" ]; then
+          echo "mudlib-sync: already at ${WARP_REF}, no reset needed"
+          exit 0
+        fi
+        echo "mudlib-sync: resetting volume (had: ${current:-<empty>})"
+        rm -rf /mudlib/* /mudlib/.[!.]* 2>/dev/null || true
+        git clone --no-checkout "${WARP_REPO}" /mudlib
+        git -C /mudlib checkout --detach "${WARP_REF}"
+        rm -rf /mudlib/.git
+        echo "mudlib-sync: done, at ${WARP_REF}"
+
+  # Nightly backup: pg_dump + mudlib tarball, age-encrypted, uploaded to
+  # Azure Blob (D-P1.12, superseded from S3 per OBI-62/R6-12). Disabled by
+  # default: the board deferred backup credentials (OBI-109), so
+  # AZURE_STORAGE_ACCOUNT/CONTAINER/SAS_TOKEN and BACKUP_AGE_RECIPIENT are
+  # empty in staging/images.env and staging/secrets.env.example until then.
+  # backup.sh checks for that and exits 0 (a documented no-op), so an empty
+  # config never fails a reconcile. Started by staging/loom-backup.timer,
+  # not by `docker compose up` (`profiles: ["backup"]` keeps it out of the
+  # default `up -d`; the timer runs `docker compose run --rm backup`).
+  backup:
+    image: ${BACKUP_IMAGE}
+    profiles: ["backup"]
+    restart: "no"
+    entrypoint: ["/bin/sh", "/scripts/backup.sh"]
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      AZURE_STORAGE_ACCOUNT: ${AZURE_STORAGE_ACCOUNT:-}
+      AZURE_STORAGE_CONTAINER: ${AZURE_STORAGE_CONTAINER:-}
+      AZURE_STORAGE_SAS_TOKEN: ${AZURE_STORAGE_SAS_TOKEN:-}
+      BACKUP_AGE_RECIPIENT: ${BACKUP_AGE_RECIPIENT:-}
+    volumes:
+      - ./backup.sh:/scripts/backup.sh:ro
+      - mudlib:/mudlib:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Optional observability profile: `docker compose --profile obs up -d`.
+  prometheus:
+    image: ${PROMETHEUS_IMAGE}
+    profiles: ["obs"]
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    expose:
+      - "9090"
+
+  grafana:
+    image: ${GRAFANA_IMAGE}
+    profiles: ["obs"]
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    expose:
+      - "3000"
+
+volumes:
+  pgdata:
+  mudlib:
+  caddy-data:
+  caddy-config:
+  prometheus-data:
+  grafana-data:

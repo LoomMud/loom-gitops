@@ -1,0 +1,130 @@
+# SPDX-FileCopyrightText: 2026 Oberfield
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# staging/images.env image-bump automation (R6, OBI-42; D-P1.9). Opens a
+# PR that updates LOOM_IMAGE to the newest signed pre-release digest.
+# Merge = deploy (the reconciler picks it up on its next 2-minute run);
+# revert the merge = rollback.
+#
+# Triggers:
+#   - repository_dispatch (type: loom-release), meant to be fired by the
+#     R5 release job in LoomMud/loom on a successful tag push. That job
+#     needs a cross-repo token (a fine-grained PAT scoped to
+#     LoomMud/loom-gitops contents+PRs, or a GitHub App), which is not
+#     provisioned yet -- until it is, this dispatch never fires and the
+#     schedule below is the only trigger. Tracked as a follow-up on OBI-42.
+#   - schedule, every 15 minutes: polls GHCR directly, so image bumps
+#     aren't silently missed while the dispatch wiring above doesn't
+#     exist. Harmless/no-op (no PR) if nothing new was published.
+#   - workflow_dispatch: manual run.
+name: bump-staging
+
+on:
+  repository_dispatch:
+    types: [loom-release]
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+  packages: read
+
+jobs:
+  bump:
+    runs-on: ${{ (vars.CI_RUNS_ON && startsWith(vars.CI_RUNS_ON, '[')) && fromJSON(vars.CI_RUNS_ON) || (vars.CI_RUNS_ON || 'ubuntu-latest') }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Install cosign
+        run: |
+          set -euo pipefail
+          COSIGN_VERSION=v2.6.1
+          curl -sSfL "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64" -o "$HOME/.local/bin/cosign"
+          mkdir -p "$HOME/.local/bin"
+          chmod +x "$HOME/.local/bin/cosign"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # Newest pre-release version of ghcr.io/loommud/loom, by GHCR
+      # package-version creation time. Needs `packages: read` and, while
+      # the package is private (pending OBI-109), org membership/linkage
+      # that lets this repo's GITHUB_TOKEN see LoomMud/loom's package
+      # versions; if that 403s, the job fails loudly rather than silently
+      # skipping (see the `gh api` step's error handling).
+      - name: Find newest pre-release digest
+        id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          versions_json="$(gh api -H "Accept: application/vnd.github+json" \
+            "/orgs/LoomMud/packages/container/loom/versions?per_page=50")"
+          # Pre-release tags only (vX.Y.Z-alpha.N / -beta.N / -rc.N), newest
+          # `created_at` first. `latest` and bare `vX.Y.Z` releases are not
+          # staging material.
+          newest="$(echo "$versions_json" | jq -r '
+            [.[] | select(.metadata.container.tags[]? | test("^v[0-9]+\\.[0-9]+\\.[0-9]+-(alpha|beta|rc)\\."))]
+            | sort_by(.created_at) | last
+          ')"
+          if [ "$newest" = "null" ] || [ -z "$newest" ]; then
+            echo "no pre-release version found; nothing to do"
+            echo "digest=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          digest="$(echo "$newest" | jq -r '.name')"          # GHCR version "name" is the sha256 digest
+          tag="$(echo "$newest" | jq -r '.metadata.container.tags[0]')"
+          echo "digest=sha256:${digest#sha256:}" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: cosign verify
+        if: steps.find.outputs.digest != ''
+        run: |
+          set -euo pipefail
+          cosign verify "ghcr.io/loommud/loom@${{ steps.find.outputs.digest }}" \
+            --certificate-identity-regexp '^https://github.com/LoomMud/loom/\.github/workflows/release-image\.yml@refs/tags/.*$' \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
+
+      - name: Update images.env if changed
+        id: update
+        if: steps.find.outputs.digest != ''
+        run: |
+          set -euo pipefail
+          new="ghcr.io/loommud/loom@${{ steps.find.outputs.digest }}"
+          current="$(grep '^LOOM_IMAGE=' staging/images.env | cut -d= -f2-)"
+          if [ "$current" = "$new" ]; then
+            echo "LOOM_IMAGE already up to date ($new); nothing to do"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          sed -i "s|^LOOM_IMAGE=.*|LOOM_IMAGE=${new}|" staging/images.env
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Open PR
+        if: steps.update.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@5e914681df9dc83aa4e4905692ca88beb2f9e91f # v7.0.5
+        with:
+          token: ${{ github.token }}
+          branch: bump-staging/loom-${{ steps.find.outputs.tag }}
+          delete-branch: true
+          commit-message: |
+            staging: bump LOOM_IMAGE to ${{ steps.find.outputs.tag }}
+
+            Signed-off-by: bump-staging[bot] <noreply@paperclip.ing>
+          title: "staging: bump LOOM_IMAGE to ${{ steps.find.outputs.tag }}"
+          body: |
+            Automated bump (D-P1.9). Newest signed pre-release digest for
+            `ghcr.io/loommud/loom`, found via GHCR and `cosign verify`-ed
+            against the `LoomMud/loom` `release-image.yml` OIDC identity
+            before this PR was opened.
+
+            - Tag: `${{ steps.find.outputs.tag }}`
+            - Digest: `${{ steps.find.outputs.digest }}`
+            - Release: https://github.com/LoomMud/loom/releases/tag/${{ steps.find.outputs.tag }}
+
+            **Merge = deploy** (the reconciler picks this up on its next
+            2-minute run and recreates the `loom` container; SIGTERM lets
+            it save state and close sockets, D-P1.10). **Revert this merge
+            commit = rollback** to the previous digest.
+          labels: staging-bump

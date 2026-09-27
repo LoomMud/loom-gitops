@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: 2026 Oberfield
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Optional obs profile (staging/compose.yaml `--profile obs`). Scrapes
+# loom's internal HTTP :8080 /metrics (R6 acceptance criteria). Until
+# loom-http ships that endpoint, this target 404s/refuses; Prometheus
+# just logs scrape failures and stays up.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["prometheus:9090"]
+
+  - job_name: loom
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["loom:8080"]
