@@ -1,0 +1,17 @@
+# SPDX-FileCopyrightText: 2026 Oberfield
+# SPDX-License-Identifier: AGPL-3.0-only
+[Unit]
+Description=Loom staging reconciler (fast-forward + cosign verify + compose up)
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User=loom
+Group=loom
+Environment=LOOM_GITOPS_DIR=/opt/loom-gitops
+Environment=LOOM_SECRETS_FILE=/etc/loom/secrets.env
+ExecStart=/opt/loom-gitops/staging/reconcile.sh
+# Secrets file is root:loom 0640, readable by the loom group (SETUP.md §3.4).
+TimeoutStartSec=300

@@ -1,0 +1,12 @@
+# SPDX-FileCopyrightText: 2026 Oberfield
+# SPDX-License-Identifier: AGPL-3.0-only
+[Unit]
+Description=Nightly Loom staging backup, 2h clear of the 04:30 UTC unattended-upgrade reboot window (D-P1.12)
+
+[Timer]
+OnCalendar=*-*-* 02:30:00 UTC
+AccuracySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
