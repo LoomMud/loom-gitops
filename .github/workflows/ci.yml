@@ -65,7 +65,11 @@ jobs:
       - name: shellcheck staging scripts
         run: |
           set -euo pipefail
-          shellcheck staging/*.sh
+          # SC1090/SC1091: reconcile.sh/restore.sh source images.env/secrets.env by a
+          # runtime path, which shellcheck can't statically follow -- expected, not a bug.
+          # SC2015 (restore.sh usage guard): `A && B || C` is intentional here; C (usage)
+          # only runs when a required arg check fails, and usage() always exits nonzero.
+          shellcheck --exclude=SC1090,SC1091,SC2015 staging/*.sh
       - name: render full compose config (no image pull)
         env:
           POSTGRES_PASSWORD: ci-throwaway-password
