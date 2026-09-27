@@ -9,7 +9,7 @@ permissions:
   contents: read
 jobs:
   dco:
-    runs-on: ${{ vars.CI_RUNS_ON || 'ubuntu-latest' }}
+    runs-on: ${{ (vars.CI_RUNS_ON && !github.event.pull_request.head.repo.fork) && (startsWith(vars.CI_RUNS_ON, '[') && fromJSON(vars.CI_RUNS_ON) || vars.CI_RUNS_ON) || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -22,7 +22,7 @@ jobs:
             scripts/check-dco.sh
           fi
   hygiene:
-    runs-on: ${{ vars.CI_RUNS_ON || 'ubuntu-latest' }}
+    runs-on: ${{ (vars.CI_RUNS_ON && !github.event.pull_request.head.repo.fork) && (startsWith(vars.CI_RUNS_ON, '[') && fromJSON(vars.CI_RUNS_ON) || vars.CI_RUNS_ON) || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
         with:
