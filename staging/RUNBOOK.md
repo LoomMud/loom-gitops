@@ -162,7 +162,8 @@ git push origin main
 ```
 
 The reconciler fast-forwards to the reverted `main` on its next run (up to
-2 minutes) and recreates `loom` at the previous digest. No host access is
+2 minutes) and recreates `loom` at the previous digest (or, for a `WARP_REF`
+revert, after `mudlib-sync` has reset the volume to the previous ref). No host access is
 needed for a rollback -- it's a normal PR/revert against `loom-gitops`.
 
 ## 9. OBI-148: rolling the S2 tier policy onto staging
@@ -184,7 +185,10 @@ order, not in parallel:
    domains. Verify with the two `SELECT`s at the end of that file.
 3. Only then merge a `WARP_REF` bump to `a50a002` (or later `main`).
    `mudlib-sync` resets the `mudlib` volume and the reconciler recreates
-   `loom` and `caddy` on its next run (up to 2 minutes).
+   `loom` on its next run (up to 2 minutes). The recreate comes from the
+   `org.loommud.warp-ref` label in `compose.yaml`. Before that label
+   existed, the volume changed under a running driver and `loom` had to be
+   recreated by hand (`up -d --no-deps --force-recreate loom`, OBI-152).
 4. Verify: staff can log in and `roles <name>` shows their tier; run
    `LOOM_SMOKE_DATABASE_URL=<staging loom_app url> tests/smoke.py tiers`
    from a host/workstation that can reach the staging Postgres, or the

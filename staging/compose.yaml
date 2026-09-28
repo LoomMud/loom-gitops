@@ -22,6 +22,12 @@ services:
     restart: unless-stopped
     stop_grace_period: 30s
     command: ["serve", "--mudlib", "/mudlib"]
+    labels:
+      # Not read by anything. It puts WARP_REF into this service's config
+      # hash, so `up -d` recreates loom when the mudlib ref moves.
+      # Otherwise mudlib-sync swaps the volume under a running driver that
+      # keeps the old master loaded (seen on the OBI-148 rollout, OBI-152).
+      org.loommud.warp-ref: ${WARP_REF}
     environment:
       LOOM_TELNET_ADDR: 0.0.0.0:4000
       # loom-http (health/ready/metrics/WS). Pinned explicitly: the binary's
