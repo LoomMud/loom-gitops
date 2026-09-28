@@ -182,7 +182,7 @@ container recreate).
 | D2 | Containers healthy | `sudo docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'` | `loom`, `caddy`, `postgres` `Up … (healthy)`; `mudlib-sync` exited 0 |
 | D3 | Telnet banner | `telnet system.loommud.com 4000` (quit with `Ctrl-]` then `quit`) | Loom banner / login prompt |
 | D4 | Character round-trip | log in (or create a throwaway character), walk somewhere or set a variable, quit, reconnect | state persisted (proves the recreate was a graceful SIGTERM, D-P1.10, not a data-losing crash) |
-| D5 | Web client, HTTPS | open `https://loommud.com/` in a browser, or `curl -sSI https://loommud.com/` | TLS handshake succeeds (not `526`/`525`/`521`); `server: cloudflare` and a `cf-ray:` header; **not** a connection error -- a `404` here means the web-client route itself isn't wired up yet (OBI-109), which is a separate, already-tracked gap, not a reconcile failure |
+| D5 | Web client, HTTPS | open `https://loommud.com/` in a browser, or `curl -sS https://loommud.com/` | `200` and the client's `index.html` (a real page, not a `404`) -- since OBI-158, `loom-http` serves the built web client itself as its router fallback (`LOOM_WEB_ROOT`, defaulted in the image), same origin as `/ws` |
 | D6 | Origin not reachable around Cloudflare | `curl -sS --max-time 8 -o /dev/null -w '%{http_code}\n' --resolve loommud.com:443:PUBLIC_IPV4 https://loommud.com/` | `000` (timeout) -- this is the **expected**, correct result of the §4.5 Cloudflare-only firewall rule, not a bug. If you instead get a real HTTP response here, the firewall rule has regressed. |
 | D7 | Metrics not public | `curl -s -o /dev/null -w '%{http_code}\n' https://loommud.com/metrics` | `403` or `404`, **not** `200` |
 
