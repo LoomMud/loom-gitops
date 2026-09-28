@@ -24,8 +24,9 @@ HEALTH_WAIT_SECS="${LOOM_HEALTH_WAIT_SECS:-120}"
 log() { printf '%s reconcile: %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"; }
 
 # Secrets: GITHUB_STATUS_TOKEN (required for step 5), optional GHCR_TOKEN
-# (step 3 fallback), POSTGRES_PASSWORD / AZURE_* (read by compose itself
-# via env_file, not by this script). Never echoed, never logged.
+# (step 3 fallback), POSTGRES_SUPERUSER_PASSWORD / LOOM_OWNER_PASSWORD /
+# LOOM_APP_PASSWORD / AZURE_* (read by compose itself via env_file, not by
+# this script). Never echoed, never logged.
 if [ -r "$SECRETS_FILE" ]; then
   # shellcheck disable=SC1090
   set -a; . "$SECRETS_FILE"; set +a

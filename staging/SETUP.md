@@ -852,7 +852,7 @@ sudo stat -c '%U:%G %a' /etc/loom/secrets.env      # expect: root:loom 640
 ```
 Expected contents: `NAME=value`, one per line, no spaces around `=`.
 
-**On `system.loommud.com` this is already done (OBI-106).** The file has the `secrets.env.example` layout, and `POSTGRES_PASSWORD` was generated on the host (48 hex characters; to copy it into the password manager, use `sudo grep ^POSTGRES_PASSWORD= /etc/loom/secrets.env` in your own session). **The only board step left is the GitHub token.** Run `sudoedit /etc/loom/secrets.env` and replace `REPLACE_WITH_GITHUB_PAT` on **line 8** (`GITHUB_STATUS_TOKEN=…`) with the §8.1 token. Leave the backup lines commented out until §6 and §7 are done.
+**On `system.loommud.com` this is already done (OBI-106), but needs an update (OBI-130).** The file has the `secrets.env.example` layout from OBI-106, with a single `POSTGRES_PASSWORD` (48 hex characters). **OBI-130 (DB role separation) replaced that one variable with three** -- `POSTGRES_SUPERUSER_PASSWORD`, `LOOM_OWNER_PASSWORD`, `LOOM_APP_PASSWORD` -- so a board admin must `sudoedit /etc/loom/secrets.env` and: rename the existing `POSTGRES_PASSWORD` line's value to `POSTGRES_SUPERUSER_PASSWORD` (or generate a fresh one), then add `LOOM_OWNER_PASSWORD` and `LOOM_APP_PASSWORD`, each its own `openssl rand -hex 24`. This is safe to do before bootstrap (§9.3): the `pgdata` volume doesn't exist yet, so there is no existing schema/superuser to reconcile against. **Agents do not have host access for this step** (no `loom-agent` SSH governance ticket yet, per this doc's charter) -- a board admin must make the edit. The GitHub token step is unchanged: run `sudoedit /etc/loom/secrets.env` and replace `REPLACE_WITH_GITHUB_PAT` on the `GITHUB_STATUS_TOKEN=…` line with the §8.1 token. Leave the backup lines commented out until §6 and §7 are done.
 
 The **variable names** are fixed in `staging/secrets.env.example` (CTO decision, OBI-106; R6 must use them). By design (D-P1.13, updated for Azure) they cover:
 - the Postgres password (from `openssl` above);
@@ -951,7 +951,7 @@ Nothing else. No keys, tokens, passwords or `secrets.env` contents.
 | # | Item | Guide's working assumption |
 |---|---|---|
 | R6-1 | `bootstrap.sh` invocation, run-as user, flags | `sudo /opt/loom-gitops/staging/bootstrap.sh` |
-| R6-2 | Exact `secrets.env` variable names | **Fixed (OBI-106):** `POSTGRES_PASSWORD`, `GITHUB_STATUS_TOKEN`, `AZURE_STORAGE_ACCOUNT`, `AZURE_STORAGE_CONTAINER`, `AZURE_STORAGE_SAS_TOKEN`, optional `GHCR_TOKEN` (see `staging/secrets.env.example`). If R6 needs a rename, change the example file and the host file in the same PR/run. |
+| R6-2 | Exact `secrets.env` variable names | **Updated (OBI-130, supersedes OBI-106's single `POSTGRES_PASSWORD`):** `POSTGRES_SUPERUSER_PASSWORD`, `LOOM_OWNER_PASSWORD`, `LOOM_APP_PASSWORD`, `GITHUB_STATUS_TOKEN`, `AZURE_STORAGE_ACCOUNT`, `AZURE_STORAGE_CONTAINER`, `AZURE_STORAGE_SAS_TOKEN`, optional `GHCR_TOKEN` (see `staging/secrets.env.example`). If R6 needs a further rename, change the example file and the host file in the same PR/run. |
 | R6-3 | Reconciler unit user, paths and names | `User=loom`; `/etc/loom/secrets.env` `root:loom 0640`, dir `/etc/loom` `0750` (CTO decision, supersedes D-P1.13's "root 0600" and the earlier `loom-staging` names) |
 | R6-4 | Clone path | `/opt/loom-gitops`, owned by `loom` |
 | R6-5 | cosign: host package or container | host `cosign` installed from Ubuntu universe either way |
