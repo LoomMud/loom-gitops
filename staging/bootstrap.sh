@@ -57,7 +57,7 @@ sec_perms="$(stat -c '%U:%G %a' "$SECRETS_DIR")"
 [ "$sec_perms" = "root:loom 750" ] || fatal "$SECRETS_DIR is $sec_perms, expected 'root:loom 750'"
 file_perms="$(stat -c '%U:%G %a' "$SECRETS_FILE")"
 [ "$file_perms" = "root:loom 640" ] || fatal "$SECRETS_FILE is $file_perms, expected 'root:loom 640'"
-for required in POSTGRES_PASSWORD GITHUB_STATUS_TOKEN; do
+for required in POSTGRES_SUPERUSER_PASSWORD LOOM_OWNER_PASSWORD LOOM_APP_PASSWORD GITHUB_STATUS_TOKEN; do
   grep -q "^${required}=." "$SECRETS_FILE" || fatal "$SECRETS_FILE is missing a value for $required"
 done
 log "secrets.env present with correct ownership/mode"

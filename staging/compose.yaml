@@ -24,7 +24,11 @@ services:
     command: ["serve", "--mudlib", "/mudlib"]
     environment:
       LOOM_TELNET_ADDR: 0.0.0.0:4000
-      DATABASE_URL: postgres://loom:${POSTGRES_PASSWORD}@postgres:5432/loom
+      # loom_app (D-27.4, OBI-130): the world-runtime login. Not an owner,
+      # no DDL rights, no INSERT/UPDATE/DELETE on the role tables (see
+      # loom-persist/migrations/0001_init.sql). Never the superuser and
+      # never loom_owner (that login is for migrations only, below).
+      DATABASE_URL: postgres://loom_app:${LOOM_APP_PASSWORD}@postgres:5432/loom
     volumes:
       - mudlib:/mudlib:ro
     ports:
@@ -55,6 +59,13 @@ services:
         condition: service_healthy
       mudlib-sync:
         condition: service_completed_successfully
+      # TODO(OBI-130 follow-up): once a LOOM_IMAGE digest bump picks up
+      # loom#51 (`loom migrate`), add `migrate: {condition:
+      # service_completed_successfully}` here, the same way mudlib-sync is
+      # gated above. The pinned digest today (images.env) predates that
+      # subcommand, so `migrate` (below) is a documented manual step for
+      # now (RUNBOOK.md), not an automatic dependency -- wiring it in
+      # before the image supports it would fail every reconcile.
 
   caddy:
     image: ${CADDY_IMAGE}
@@ -81,16 +92,29 @@ services:
     image: ${POSTGRES_IMAGE}
     restart: unless-stopped
     stop_grace_period: 30s
-    # Internal only: no `ports:` entry. Reachable from `loom` and `backup`
-    # over the compose network, never published to the host.
+    # Internal only: no `ports:` entry. Reachable from `loom`, `migrate`
+    # and `backup` over the compose network, never published to the host.
+    #
+    # DB role separation (OBI-130, D-27.4): POSTGRES_USER here is the
+    # Postgres *superuser*, used only by ./postgres/init/01-create-roles.sh
+    # (docker-entrypoint-initdb.d, first init of an empty `pgdata` volume
+    # only) to create `loom_owner` (owns the DB, runs migrations) and
+    # `loom_app` (the world-runtime login, granted narrow privileges by
+    # the migrations themselves). Neither `loom` (this stack's DATABASE_URL
+    # / LOOM_DB_MIGRATE_URL) is the superuser login below -- it is never
+    # used by the `loom` or `migrate` services, matching CI's setup step
+    # (LoomMud/loom .github/workflows/ci.yml).
     environment:
-      POSTGRES_USER: loom
+      POSTGRES_USER: loom_superuser
       POSTGRES_DB: loom
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD}
+      LOOM_OWNER_PASSWORD: ${LOOM_OWNER_PASSWORD}
+      LOOM_APP_PASSWORD: ${LOOM_APP_PASSWORD}
     volumes:
       - pgdata:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U loom -d loom"]
+      test: ["CMD-SHELL", "pg_isready -U loom_superuser -d loom"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -136,6 +160,26 @@ services:
         echo "${WARP_REF}" > /mudlib/.warp-ref
         echo "mudlib-sync: done, at ${WARP_REF}"
 
+  # One-shot migration runner (D-27.4, OBI-130): applies loom-persist's
+  # sqlx migrations as `loom_owner`, the schema owner -- never the
+  # superuser, never `loom_app`. `profiles: ["migrate"]` keeps it out of
+  # the default `up -d` (same pattern as `backup` below); run it
+  # explicitly with `docker compose --profile migrate run --rm migrate`
+  # (RUNBOOK.md). Not yet an automatic `depends_on` of `loom` (see the
+  # TODO on `loom` above) because the pinned LOOM_IMAGE predates the
+  # `migrate` subcommand (loom#51) -- wiring it in before the image
+  # supports it would fail every reconcile.
+  migrate:
+    image: ${LOOM_IMAGE}
+    profiles: ["migrate"]
+    restart: "no"
+    command: ["migrate"]
+    environment:
+      LOOM_DB_MIGRATE_URL: postgres://loom_owner:${LOOM_OWNER_PASSWORD}@postgres:5432/loom
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   # Nightly backup: pg_dump + mudlib tarball, age-encrypted, uploaded to
   # Azure Blob (D-P1.12, superseded from S3 per OBI-62/R6-12). Disabled by
   # default: the board deferred backup credentials (OBI-109), so
@@ -145,13 +189,15 @@ services:
   # config never fails a reconcile. Started by staging/loom-backup.timer,
   # not by `docker compose up` (`profiles: ["backup"]` keeps it out of the
   # default `up -d`; the timer runs `docker compose run --rm backup`).
+  # pg_dump runs as `loom_owner` (OBI-130): it owns every table, so a dump
+  # captures the full schema/definitions without needing superuser access.
   backup:
     image: ${BACKUP_IMAGE}
     profiles: ["backup"]
     restart: "no"
     entrypoint: ["/bin/sh", "/scripts/backup.sh"]
     environment:
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      LOOM_OWNER_PASSWORD: ${LOOM_OWNER_PASSWORD}
       AZURE_STORAGE_ACCOUNT: ${AZURE_STORAGE_ACCOUNT:-}
       AZURE_STORAGE_CONTAINER: ${AZURE_STORAGE_CONTAINER:-}
       AZURE_STORAGE_SAS_TOKEN: ${AZURE_STORAGE_SAS_TOKEN:-}

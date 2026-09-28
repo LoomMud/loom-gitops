@@ -20,7 +20,9 @@ sudo install -o root -g loom -m 0640 /opt/loom-gitops/staging/secrets.env.exampl
 sudoedit /etc/loom/secrets.env
 ```
 
-Fill in at least `POSTGRES_PASSWORD` (`openssl rand -hex 24`) and
+Fill in at least `POSTGRES_SUPERUSER_PASSWORD`, `LOOM_OWNER_PASSWORD`,
+`LOOM_APP_PASSWORD` (each its own `openssl rand -hex 24`, OBI-130 DB role
+separation -- see `secrets.env.example` for what each login is for) and
 `GITHUB_STATUS_TOKEN` (SETUP.md §8.1). Leave the `AZURE_STORAGE_*` and
 `GHCR_TOKEN` lines commented out until they're provisioned (OBI-109);
 `staging/backup.sh` and `staging/reconcile.sh` both tolerate that as a
@@ -53,7 +55,27 @@ sudo systemctl start loom-backup.service      # manual first backup trigger
                                                # (same script the timer uses)
 ```
 
-## 3. Check it's up
+## 3. Run migrations (loom_owner)
+
+**Manual step today (OBI-130):** the pinned `LOOM_IMAGE` (`images.env`)
+predates the `loom migrate` subcommand (loom#51). Once a digest bump
+picks that up, run it once against a fresh or upgraded schema:
+
+```bash
+sudo docker compose --project-directory /opt/loom-gitops/staging \
+  --env-file /opt/loom-gitops/staging/images.env --env-file /etc/loom/secrets.env \
+  -f /opt/loom-gitops/staging/compose.yaml --profile migrate run --rm migrate
+```
+
+This authenticates as `loom_owner` (`LOOM_DB_MIGRATE_URL`, compose.yaml),
+never the superuser or `loom_app`. It's idempotent (`sqlx migrate` tracks
+applied migrations in `_sqlx_migrations`), so re-running it after a
+no-op reconcile is harmless. Once this is proven on staging, a follow-up
+PR wires it into `compose.yaml`'s `loom: depends_on:` (see the TODO
+comment there) so `reconcile.sh` runs it automatically before `loom`
+starts, the same way `mudlib-sync` already gates `loom`.
+
+## 4. Check it's up
 
 ```bash
 sudo docker compose --project-directory /opt/loom-gitops/staging \
@@ -64,7 +86,7 @@ Expect `loom`, `caddy`, `postgres` `Up ... (healthy)` and `mudlib-sync`
 `Exited (0)`. Then the full checklist in `SETUP.md` §9.4 (DNS, firewall,
 TLS, telnet, web client, commit status).
 
-## 4. Rebuild a lost host from git + the last dump
+## 5. Rebuild a lost host from git + the last dump
 
 If the host is gone (disk failure, terminated instance, etc.), and Azure
 Blob backups are configured and have at least one nightly run:
@@ -97,7 +119,7 @@ Blob backups are configured and have at least one nightly run:
    in step 2, and the tarball is only needed for anything not in that ref
    (there shouldn't be any -- the mudlib volume is git-sourced by design).
 
-## 5. Restore drill
+## 6. Restore drill
 
 ```bash
 # on an admin workstation, or the host, with age/rclone/docker available
@@ -123,7 +145,7 @@ the drill referenced in the OBI-42 acceptance criteria; its output belongs
 in the OBI-42 evidence, not here (it doesn't touch the real host or
 secrets, so it can be re-run at will).
 
-## 6. Roll back
+## 7. Roll back
 
 Every deploy is a git commit. To roll back:
 
@@ -136,7 +158,7 @@ The reconciler fast-forwards to the reverted `main` on its next run (up to
 2 minutes) and recreates `loom` at the previous digest. No host access is
 needed for a rollback -- it's a normal PR/revert against `loom-gitops`.
 
-## 7. Upgrades recreate the container, they don't restart the host
+## 8. Upgrades recreate the container, they don't restart the host
 
 A `LOOM_IMAGE` digest bump (merged `bump-staging.yml` PR, or a hand-edited
 `images.env` change) makes the next reconcile recreate **only** the `loom`
