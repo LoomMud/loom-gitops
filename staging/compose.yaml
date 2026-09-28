@@ -40,16 +40,11 @@ services:
     expose:
       - "8080"
     healthcheck:
-      # TODO(R6 follow-up, tracked on OBI-132): the pinned LOOM_IMAGE
-      # (v0.1.0-alpha.1) predates loom-http's `:8080` (/healthz, /readyz),
-      # which doesn't exist yet, so there is no HTTP endpoint to probe
-      # today even though `loom probe` (loom#42) shipped in this image.
-      # This uses bash's `/dev/tcp` (bash ships in debian:bookworm-slim)
-      # as a bare TCP-listening check on the telnet port. Once a
-      # LOOM_IMAGE digest bump picks up loom-http's `/healthz`, switch
-      # this to `["CMD", "/usr/local/bin/loom", "probe", "http://127.0.0.1:8080/healthz"]`
-      # (no bash dependency, checks readiness, not just "a socket is open").
-      test: ["CMD-SHELL", "bash -c '(exec 3<>/dev/tcp/127.0.0.1/4000) 2>/dev/null'"]
+      # loom probe (loom#42, cbaebb6) + loom-http's /healthz shipped in
+      # LOOM_IMAGE v0.1.0-alpha.2 (OBI-132). Uses the driver's own HTTP
+      # client against its own readiness endpoint instead of a bare
+      # /dev/tcp TCP-open check on the telnet port.
+      test: ["CMD", "/usr/local/bin/loom", "probe", "http://127.0.0.1:8080/healthz"]
       interval: 10s
       timeout: 5s
       retries: 5

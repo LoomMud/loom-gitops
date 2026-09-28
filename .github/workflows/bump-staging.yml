@@ -42,8 +42,8 @@ jobs:
         run: |
           set -euo pipefail
           COSIGN_VERSION=v2.6.1
-          curl -sSfL "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64" -o "$HOME/.local/bin/cosign"
           mkdir -p "$HOME/.local/bin"
+          curl -sSfL "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64" -o "$HOME/.local/bin/cosign"
           chmod +x "$HOME/.local/bin/cosign"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
