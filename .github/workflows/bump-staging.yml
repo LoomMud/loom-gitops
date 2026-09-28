@@ -108,6 +108,13 @@ jobs:
           token: ${{ github.token }}
           branch: bump-staging/loom-${{ steps.find.outputs.tag }}
           delete-branch: true
+          # Explicit author, matching the Signed-off-by trailer below
+          # exactly (OBI-155): without this the action defaults the commit
+          # author to whichever identity triggered the run (workflow_dispatch
+          # takes github.actor; that isn't a fixed bot until per-agent GitHub
+          # identities land, OBI-43), which mismatches the hardcoded
+          # Signed-off-by trailer and fails the dco check on the PR it opens.
+          author: "bump-staging[bot] <noreply@paperclip.ing>"
           commit-message: |
             staging: bump LOOM_IMAGE to ${{ steps.find.outputs.tag }}
 
