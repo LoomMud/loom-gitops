@@ -38,7 +38,7 @@ services:
       # no DDL rights, no INSERT/UPDATE/DELETE on the role tables (see
       # loom-persist/migrations/0001_init.sql). Never the superuser and
       # never loom_owner (that login is for migrations only, below).
-      DATABASE_URL: postgres://loom_app:${LOOM_APP_PASSWORD}@postgres:5432/loom
+      DATABASE_URL: postgres://loom_app:${LOOM_APP_PASSWORD}@loom-db:5432/loom
     volumes:
       - mudlib:/mudlib:ro
     ports:
@@ -115,6 +115,13 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD}
       LOOM_OWNER_PASSWORD: ${LOOM_OWNER_PASSWORD}
       LOOM_APP_PASSWORD: ${LOOM_APP_PASSWORD}
+    # loom/warp refuse to connect to the literal host `postgres:5432`
+    # (loom-persist `assert_not_control_plane_db`, OBI-151): that is the
+    # shape of Paperclip's control-plane DSN. Loom's own DSNs therefore use
+    # this network alias instead of the service name.
+    networks:
+      default:
+        aliases: [loom-db]
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./postgres/init:/docker-entrypoint-initdb.d:ro
@@ -176,7 +183,7 @@ services:
     restart: "no"
     command: ["migrate"]
     environment:
-      LOOM_DB_MIGRATE_URL: postgres://loom_owner:${LOOM_OWNER_PASSWORD}@postgres:5432/loom
+      LOOM_DB_MIGRATE_URL: postgres://loom_owner:${LOOM_OWNER_PASSWORD}@loom-db:5432/loom
     depends_on:
       postgres:
         condition: service_healthy
