@@ -100,7 +100,7 @@ jobs:
           # via postgres/init/01-create-roles.sh; loom_owner and loom_app
           # never see the superuser password).
           POSTGRES_SUPERUSER_PASSWORD: ci-throwaway-superuser-password
-          LOOM_OWNER_PASSWORD: ci-throwaway-owner-password
+          LOOM_OWNER_PASSWORD: "ci-throwaway-owner-pass'word"
           LOOM_APP_PASSWORD: ci-throwaway-app-password
         run: |
           set -euo pipefail
@@ -118,6 +118,13 @@ jobs:
           # tracked by the .warp-ref marker file written at the end of the script (this
           # task's fix for the review's wipe-on-every-reconcile bug), not `git log`.
           docker run --rm -v loom_mudlib:/m alpine cat /m/.warp-ref
+          # OBI-130: both least-privilege logins authenticate over TCP (password
+          # auth, not the local trust socket). The owner password deliberately
+          # contains a single quote, proving 01-create-roles.sh quotes via psql
+          # variables rather than splicing the value into SQL.
+          pg_cid="$(docker compose --env-file staging/images.env --env-file staging/secrets.env.example -f staging/compose.yaml ps -q postgres)"
+          docker exec -e PGPASSWORD="$LOOM_OWNER_PASSWORD" "$pg_cid" psql -h 127.0.0.1 -U loom_owner -d loom -tAc "select current_user, (select pg_get_userbyid(datdba) from pg_database where datname='loom')" | grep -qx 'loom_owner|loom_owner' || { echo "loom_owner login or DB ownership check failed"; exit 1; }
+          docker exec -e PGPASSWORD="$LOOM_APP_PASSWORD" "$pg_cid" psql -h 127.0.0.1 -U loom_app -d loom -tAc "select current_user, rolsuper from pg_roles where rolname=current_user" | grep -qx 'loom_app|f' || { echo "loom_app login check failed (or it is a superuser)"; exit 1; }
           echo "boot 1: postgres healthy, mudlib-sync exited 0, container ids:"
           docker compose --env-file staging/images.env --env-file staging/secrets.env.example -f staging/compose.yaml ps -a --format 'table {{.Name}}\t{{.ID}}\t{{.Status}}'
       - name: up -d (boot 2) -- must not recreate containers or reset mudlib
@@ -127,7 +134,7 @@ jobs:
           # secrets.env.example) would recreate the container for a reason
           # that has nothing to do with the D-P1.11 bug this job checks for.
           POSTGRES_SUPERUSER_PASSWORD: ci-throwaway-superuser-password
-          LOOM_OWNER_PASSWORD: ci-throwaway-owner-password
+          LOOM_OWNER_PASSWORD: "ci-throwaway-owner-pass'word"
           LOOM_APP_PASSWORD: ci-throwaway-app-password
         run: |
           set -euo pipefail
