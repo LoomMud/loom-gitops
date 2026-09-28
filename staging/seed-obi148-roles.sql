@@ -39,31 +39,31 @@ SELECT public.roles_bootstrap_root('gandalf', '<GANDALF-ACCOUNT-UUID>');
 --    loom_owner needs it -- loom_owner already bypasses RLS, but we still
 --    go through the function so role_changes gets a real actor and a
 --    correct old_tier compare.
-SELECT public.roles_set_tier('aragorn', 'gimli',   2, 'OBI-148 alpha staff seed');
-SELECT public.roles_set_tier('aragorn', 'legolas', 2, 'OBI-148 alpha staff seed (R6 staging)');
-SELECT public.roles_set_tier('aragorn', 'builder', 2, 'OBI-148 alpha staff seed');
--- Seed-only assertion coverage (tests/smoke.py tiers expects a T1 'appr'
--- staff row): create the appr account first if it doesn't exist yet.
-SELECT public.roles_set_tier('aragorn', 'appr',    1, 'OBI-148 seed-only apprentice for tier smoke suite');
+-- Tiers and memberships mirror warp's tests/roles-seed.json (the dev
+-- snapshot the tier suite is written against). roles_set_tier takes
+-- p_new_tier SMALLINT, so integer literals need an explicit ::smallint
+-- cast (an untyped 2 resolves as integer and no function matches).
+SELECT public.roles_set_tier('aragorn', 'legolas', 3::smallint, 'OBI-148 alpha staff seed (domain lead: start, forest)');
+SELECT public.roles_set_tier('aragorn', 'gimli',   2::smallint, 'OBI-148 alpha staff seed');
+SELECT public.roles_set_tier('aragorn', 'builder', 2::smallint, 'OBI-148 alpha staff seed');
+-- Seed-only apprentice for the tier checks (tests/smoke.py tiers).
+SELECT public.roles_set_tier('aragorn', 'appr',    1::smallint, 'OBI-148 seed-only apprentice for tier smoke suite');
 
--- 3. Domains: start, forest, test, with sensible members/leads.
---    domains has no security-definer wrapper in 0001/0002 for inserting
---    a domain row itself (roles_set_member below only manages
---    domain_members) -- domains rows are plain data, loom_owner may
---    insert them directly.
+-- 3. Domains: start, forest, test. domains has no security-definer
+--    wrapper (roles_set_member only manages domain_members); these rows
+--    are plain data that loom_owner may insert directly.
 INSERT INTO public.domains (name, state) VALUES
     ('start',  'live'),
     ('forest', 'live'),
     ('test',   'wip')
 ON CONFLICT (name) DO NOTHING;
 
--- roles_set_member(actor, domain, target_uid, role) -- see 0001_init.sql.
--- legolas leads forest and start per the OBI-148 description's "(or 3 +
--- lead of forest/start)" option; adjust if the board picks plain T2 with
--- no lead instead.
+-- roles_set_member(actor, domain, target_uid, role, reason) -- 0001_init.sql.
 SELECT public.roles_set_member('aragorn', 'start',  'legolas', 'lead',   'OBI-148 alpha staff seed');
+SELECT public.roles_set_member('aragorn', 'start',  'builder', 'member', 'OBI-148 alpha staff seed');
 SELECT public.roles_set_member('aragorn', 'forest', 'legolas', 'lead',   'OBI-148 alpha staff seed');
-SELECT public.roles_set_member('aragorn', 'test',   'gimli',   'member', 'OBI-148 alpha staff seed');
+SELECT public.roles_set_member('aragorn', 'forest', 'gimli',   'member', 'OBI-148 alpha staff seed');
+SELECT public.roles_set_member('aragorn', 'forest', 'builder', 'member', 'OBI-148 alpha staff seed');
 SELECT public.roles_set_member('aragorn', 'test',   'builder', 'member', 'OBI-148 alpha staff seed');
 
 COMMIT;
