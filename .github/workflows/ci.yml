@@ -95,7 +95,13 @@ jobs:
       # below.
       - name: up -d (boot 1)
         env:
-          POSTGRES_PASSWORD: ci-throwaway-password
+          # OBI-130 DB role separation: three throwaway CI passwords, one per
+          # login (POSTGRES_SUPERUSER_PASSWORD bootstraps loom_owner/loom_app
+          # via postgres/init/01-create-roles.sh; loom_owner and loom_app
+          # never see the superuser password).
+          POSTGRES_SUPERUSER_PASSWORD: ci-throwaway-superuser-password
+          LOOM_OWNER_PASSWORD: ci-throwaway-owner-password
+          LOOM_APP_PASSWORD: ci-throwaway-app-password
         run: |
           set -euo pipefail
           docker compose --env-file staging/images.env --env-file staging/secrets.env.example \
@@ -116,11 +122,13 @@ jobs:
           docker compose --env-file staging/images.env --env-file staging/secrets.env.example -f staging/compose.yaml ps -a --format 'table {{.Name}}\t{{.ID}}\t{{.Status}}'
       - name: up -d (boot 2) -- must not recreate containers or reset mudlib
         env:
-          # Same value as boot 1: postgres's environment is baked from this at
-          # compose-parse time, so a mismatched value here (not present in
+          # Same values as boot 1: postgres's environment is baked from these at
+          # compose-parse time, so a mismatch here (not present in
           # secrets.env.example) would recreate the container for a reason
           # that has nothing to do with the D-P1.11 bug this job checks for.
-          POSTGRES_PASSWORD: ci-throwaway-password
+          POSTGRES_SUPERUSER_PASSWORD: ci-throwaway-superuser-password
+          LOOM_OWNER_PASSWORD: ci-throwaway-owner-password
+          LOOM_APP_PASSWORD: ci-throwaway-app-password
         run: |
           set -euo pipefail
           compose() {
