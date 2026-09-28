@@ -38,6 +38,40 @@ jobs:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
+      # OBI-42/OBI-157 gap: staging/reconcile.sh already posts a red
+      # `staging/reconcile` commit status on failure (see reconcile.sh's
+      # `fail()`), but nothing was watching it -- the alpha.4 DB-guard
+      # incident sat broken for about an hour before a human noticed. This
+      # step makes that red status loud: every run of this workflow (the
+      # 15-minute schedule included) refuses to open a new bump PR on top
+      # of a broken reconcile and fails the job instead, so a red
+      # `bump-staging` Actions run (with notifications, if watchers are
+      # subscribed) tracks a broken `staging/reconcile` within 15 minutes,
+      # not an hour. It also stops bumps from stacking on top of an
+      # already-broken deploy. This is a gate, not a fix: once
+      # `staging/reconcile` is green again (the next reconciler run after
+      # the underlying problem is fixed), this step -- and normal bumping
+      # -- resumes on its own.
+      - name: Wait for a green staging/reconcile before bumping
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          latest="$(gh api "repos/LoomMud/loom-gitops/commits/${sha}/statuses" \
+            --jq '[.[] | select(.context=="staging/reconcile")][0]')"
+          if [ -z "$latest" ] || [ "$latest" = "null" ]; then
+            echo "::warning::no staging/reconcile status found at ${sha} yet (fresh host or first-ever reconcile); proceeding"
+            exit 0
+          fi
+          state="$(echo "$latest" | jq -r '.state')"
+          description="$(echo "$latest" | jq -r '.description')"
+          if [ "$state" != "success" ]; then
+            echo "::error::staging/reconcile is '${state}' at ${sha} (${description}); refusing to bump LOOM_IMAGE on top of a broken reconcile. Fix staging first (RUNBOOK.md §7 rollback or §8 post-deploy checklist), confirm the reconciler is green, then re-run this workflow (schedule or workflow_dispatch)."
+            exit 1
+          fi
+          echo "staging/reconcile is green at ${sha} (${description}); proceeding"
+
       - name: Install cosign
         run: |
           set -euo pipefail
