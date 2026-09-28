@@ -57,23 +57,30 @@ sudo systemctl start loom-backup.service      # manual first backup trigger
 
 ## 3. Run migrations (loom_owner)
 
-**Manual step today (OBI-130):** the pinned `LOOM_IMAGE` (`images.env`)
-predates the `loom migrate` subcommand (loom#51). Once a digest bump
-picks that up, run it once against a fresh or upgraded schema:
+**Automatic (OBI-130/OBI-138):** `LOOM_IMAGE` ships the `loom migrate`
+subcommand (loom#51), and `compose.yaml`'s `loom: depends_on:` gates on
+`migrate: {condition: service_completed_successfully}`, the same way it
+already gates on `mudlib-sync`. A default
 
 ```bash
 sudo docker compose --project-directory /opt/loom-gitops/staging \
   --env-file /opt/loom-gitops/staging/images.env --env-file /etc/loom/secrets.env \
-  -f /opt/loom-gitops/staging/compose.yaml --profile migrate run --rm migrate
+  -f /opt/loom-gitops/staging/compose.yaml up -d
 ```
 
-This authenticates as `loom_owner` (`LOOM_DB_MIGRATE_URL`, compose.yaml),
-never the superuser or `loom_app`. It's idempotent (`sqlx migrate` tracks
-applied migrations in `_sqlx_migrations`), so re-running it after a
-no-op reconcile is harmless. Once this is proven on staging, a follow-up
-PR wires it into `compose.yaml`'s `loom: depends_on:` (see the TODO
-comment there) so `reconcile.sh` runs it automatically before `loom`
-starts, the same way `mudlib-sync` already gates `loom`.
+applies every pending `loom_owner` migration before `loom` starts --
+there is no separate manual step. `migrate` authenticates as `loom_owner`
+(`LOOM_DB_MIGRATE_URL`, compose.yaml), never the superuser or `loom_app`.
+It's idempotent (`sqlx migrate` tracks applied migrations in
+`_sqlx_migrations`), so it's a fast no-op on every reconcile once nothing
+is pending. To run it by hand (e.g. to inspect its output outside a full
+`up -d`):
+
+```bash
+sudo docker compose --project-directory /opt/loom-gitops/staging \
+  --env-file /opt/loom-gitops/staging/images.env --env-file /etc/loom/secrets.env \
+  -f /opt/loom-gitops/staging/compose.yaml run --rm migrate
+```
 
 ## 4. Check it's up
 
