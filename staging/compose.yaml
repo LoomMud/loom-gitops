@@ -24,6 +24,10 @@ services:
     command: ["serve", "--mudlib", "/mudlib"]
     environment:
       LOOM_TELNET_ADDR: 0.0.0.0:4000
+      # loom-http (health/ready/metrics/WS). Pinned explicitly: the binary's
+      # default is 0.0.0.0:4001 (DEFAULT_HTTP_ADDR, loom-cli), but Caddy,
+      # Prometheus and the healthcheck below all target :8080.
+      LOOM_HTTP_ADDR: 0.0.0.0:8080
       # loom_app (D-27.4, OBI-130): the world-runtime login. Not an owner,
       # no DDL rights, no INSERT/UPDATE/DELETE on the role tables (see
       # loom-persist/migrations/0001_init.sql). Never the superuser and
@@ -42,8 +46,9 @@ services:
     healthcheck:
       # loom probe (loom#42, cbaebb6) + loom-http's /healthz shipped in
       # LOOM_IMAGE v0.1.0-alpha.2 (OBI-132). Uses the driver's own HTTP
-      # client against its own readiness endpoint instead of a bare
-      # /dev/tcp TCP-open check on the telnet port.
+      # client against its own liveness endpoint instead of a bare
+      # /dev/tcp TCP-open check on the telnet port. Needs LOOM_HTTP_ADDR
+      # above: loom's built-in default HTTP bind is 0.0.0.0:4001.
       test: ["CMD", "/usr/local/bin/loom", "probe", "http://127.0.0.1:8080/healthz"]
       interval: 10s
       timeout: 5s
