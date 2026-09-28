@@ -26,3 +26,5 @@ Runner selection is switchable with repository/org variable `CI_RUNS_ON` (defaul
 
 Copyright 2026 Oberfield. Licensed under the [GNU Affero General Public License v3.0 only](LICENSE)
 (`AGPL-3.0-only`). See [CONTRIBUTING.md](CONTRIBUTING.md) for the contribution policy.
+
+<!-- OBI-136 unapproved-merge verification PR (c); do not merge -->
