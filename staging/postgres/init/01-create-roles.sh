@@ -26,11 +26,19 @@ set -eu
 : "${LOOM_OWNER_PASSWORD:?LOOM_OWNER_PASSWORD must be set (see staging/secrets.env.example)}"
 : "${LOOM_APP_PASSWORD:?LOOM_APP_PASSWORD must be set (see staging/secrets.env.example)}"
 
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-SQL
-	CREATE ROLE loom_owner LOGIN PASSWORD '$LOOM_OWNER_PASSWORD';
-	CREATE ROLE loom_app LOGIN PASSWORD '$LOOM_APP_PASSWORD';
-	ALTER DATABASE "$POSTGRES_DB" OWNER TO loom_owner;
-	GRANT ALL ON DATABASE "$POSTGRES_DB" TO loom_owner;
+# Passwords go in as psql variables and are quoted by psql itself
+# (:'var' -> a properly escaped SQL literal), not spliced in by the shell,
+# so a password containing a quote can neither break nor inject into the
+# SQL. The heredoc delimiter is quoted for the same reason: no shell
+# expansion inside it.
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
+  -v owner_pw="$LOOM_OWNER_PASSWORD" \
+  -v app_pw="$LOOM_APP_PASSWORD" \
+  -v db="$POSTGRES_DB" <<-'SQL'
+	CREATE ROLE loom_owner LOGIN PASSWORD :'owner_pw';
+	CREATE ROLE loom_app LOGIN PASSWORD :'app_pw';
+	ALTER DATABASE :"db" OWNER TO loom_owner;
+	GRANT ALL ON DATABASE :"db" TO loom_owner;
 SQL
 
 echo "01-create-roles: loom_owner and loom_app created, $POSTGRES_DB owned by loom_owner"

@@ -100,9 +100,9 @@ services:
     # (docker-entrypoint-initdb.d, first init of an empty `pgdata` volume
     # only) to create `loom_owner` (owns the DB, runs migrations) and
     # `loom_app` (the world-runtime login, granted narrow privileges by
-    # the migrations themselves). Neither `loom` (this stack's DATABASE_URL
-    # / LOOM_DB_MIGRATE_URL) is the superuser login below -- it is never
-    # used by the `loom` or `migrate` services, matching CI's setup step
+    # the migrations themselves). The superuser login below is never in
+    # DATABASE_URL or LOOM_DB_MIGRATE_URL -- it is never used by the `loom`,
+    # `migrate` or `backup` services, matching CI's setup step
     # (LoomMud/loom .github/workflows/ci.yml).
     environment:
       POSTGRES_USER: loom_superuser
