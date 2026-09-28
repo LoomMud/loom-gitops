@@ -46,7 +46,12 @@ prefix="daily"
 [ "$dow" = "7" ] && prefix="weekly"  # one weekly snapshot, taken on the Sunday run
 
 log "dumping postgres"
-PGPASSWORD="${POSTGRES_PASSWORD}" pg_dump -Fc -h postgres -U loom -d loom \
+# loom_owner (D-27.4, OBI-130): it owns every table/function, so a dump
+# from this login captures the full schema, not just what loom_app can
+# SELECT. Never the superuser (only used once, at first init, by
+# postgres/init/01-create-roles.sh) and never loom_app (least privilege,
+# no need for backup access).
+PGPASSWORD="${LOOM_OWNER_PASSWORD}" pg_dump -Fc -h postgres -U loom_owner -d loom \
   -f "$WORKDIR/loom-${stamp}.dump"
 
 log "archiving mudlib"
