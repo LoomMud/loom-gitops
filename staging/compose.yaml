@@ -102,7 +102,11 @@ services:
   # because those are baked into its environment (part of the container's
   # config hash that `docker compose up` diffs). The script itself is
   # idempotent even if run again unprompted: it resets the volume only
-  # when the checked-out commit doesn't already match WARP_REF.
+  # when the checked-out commit doesn't already match WARP_REF. Because
+  # `.git` is stripped from the volume after checkout (D-P1.11 wants a
+  # plain tree, not a repo), idempotency is tracked by a `.warp-ref`
+  # marker file written after a successful checkout -- not by re-deriving
+  # the commit from `.git`, which no longer exists (loom-gitops#8 review).
   mudlib-sync:
     image: ${GIT_SYNC_IMAGE}
     restart: "no"
@@ -117,18 +121,19 @@ services:
         set -eu
         echo "mudlib-sync: target ${WARP_REPO} @ ${WARP_REF}"
         current=""
-        if [ -d /mudlib/.git ]; then
-          current=$$(git -C /mudlib rev-parse HEAD 2>/dev/null || echo "")
+        if [ -f /mudlib/.warp-ref ]; then
+          current=$$(cat /mudlib/.warp-ref 2>/dev/null || echo "")
         fi
         if [ "$$current" = "${WARP_REF}" ]; then
           echo "mudlib-sync: already at ${WARP_REF}, no reset needed"
           exit 0
         fi
-        echo "mudlib-sync: resetting volume (had: ${current:-<empty>})"
+        echo "mudlib-sync: resetting volume (had: $${current:-<empty>})"
         rm -rf /mudlib/* /mudlib/.[!.]* 2>/dev/null || true
         git clone --no-checkout "${WARP_REPO}" /mudlib
         git -C /mudlib checkout --detach "${WARP_REF}"
         rm -rf /mudlib/.git
+        echo "${WARP_REF}" > /mudlib/.warp-ref
         echo "mudlib-sync: done, at ${WARP_REF}"
 
   # Nightly backup: pg_dump + mudlib tarball, age-encrypted, uploaded to
