@@ -166,6 +166,35 @@ The reconciler fast-forwards to the reverted `main` on its next run (up to
 revert, after `mudlib-sync` has reset the volume to the previous ref). No host access is
 needed for a rollback -- it's a normal PR/revert against `loom-gitops`.
 
+## 8. Post-deploy checklist (OBI-42/OBI-157)
+
+Run this after every merged bump (`bump-staging` PR merge, a manual
+`images.env` edit, or a `WARP_REF` bump) once the reconciler has picked it
+up (up to 2 minutes; `H9`/`H10` in `SETUP.md` §9.4 show whether it has).
+It's the same telnet/web-client walk-through as `SETUP.md` §9.4 rows
+X9-X12, trimmed to what changes on a routine deploy (not a fresh-host
+bootstrap -- skip DNS/firewall/TLS-cert rows, those don't move on a
+container recreate).
+
+| # | Check | Command | Expect |
+|---|---|---|---|
+| D1 | Reconcile status | `gh api repos/LoomMud/loom-gitops/commits/main/statuses --jq '[.[] \| select(.context=="staging/reconcile")][0] \| .state + " " + .description'` | `success deployed <sha> (loom @ <digest>)` at the new merge commit |
+| D2 | Containers healthy | `sudo docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'` | `loom`, `caddy`, `postgres` `Up … (healthy)`; `mudlib-sync` exited 0 |
+| D3 | Telnet banner | `telnet system.loommud.com 4000` (quit with `Ctrl-]` then `quit`) | Loom banner / login prompt |
+| D4 | Character round-trip | log in (or create a throwaway character), walk somewhere or set a variable, quit, reconnect | state persisted (proves the recreate was a graceful SIGTERM, D-P1.10, not a data-losing crash) |
+| D5 | Web client, HTTPS | open `https://loommud.com/` in a browser, or `curl -sSI https://loommud.com/` | TLS handshake succeeds (not `526`/`525`/`521`); `server: cloudflare` and a `cf-ray:` header; **not** a connection error -- a `404` here means the web-client route itself isn't wired up yet (OBI-109), which is a separate, already-tracked gap, not a reconcile failure |
+| D6 | Origin not reachable around Cloudflare | `curl -sS --max-time 8 -o /dev/null -w '%{http_code}\n' --resolve loommud.com:443:PUBLIC_IPV4 https://loommud.com/` | `000` (timeout) -- this is the **expected**, correct result of the §4.5 Cloudflare-only firewall rule, not a bug. If you instead get a real HTTP response here, the firewall rule has regressed. |
+| D7 | Metrics not public | `curl -s -o /dev/null -w '%{http_code}\n' https://loommud.com/metrics` | `403` or `404`, **not** `200` |
+
+If `D1` isn't green within a couple of reconcile cycles (4 minutes), don't
+wait for the next scheduled `bump-staging` run to notice -- go straight to
+`journalctl -u loom-reconcile.service -n 100` on the host and §7
+(rollback) if the fix isn't quick. `bump-staging.yml` also now checks the
+current `staging/reconcile` status before opening a new bump PR (OBI-157):
+if reconcile is broken, its scheduled runs go red every 15 minutes instead
+of silently stacking a new bump on top of a broken deploy -- treat a red
+`bump-staging` Actions run as the same signal as a red `D1` here.
+
 ## 9. OBI-148: rolling the S2 tier policy onto staging
 
 Order matters: warp `a50a002` (and later) reads tiers **only** from the
