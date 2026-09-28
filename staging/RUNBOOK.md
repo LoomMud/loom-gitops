@@ -165,7 +165,40 @@ The reconciler fast-forwards to the reverted `main` on its next run (up to
 2 minutes) and recreates `loom` at the previous digest. No host access is
 needed for a rollback -- it's a normal PR/revert against `loom-gitops`.
 
-## 8. Upgrades recreate the container, they don't restart the host
+## 9. OBI-148: rolling the S2 tier policy onto staging
+
+Order matters: warp `a50a002` (and later) reads tiers **only** from the
+roles tables (§5.11.3). Bumping `WARP_REF` before the staff rows exist
+turns every account into tier 0 and hides every staff tool. Do this in
+order, not in parallel:
+
+1. Merge a `LOOM_IMAGE` bump to a digest built from `main` at or after
+   loom#54 (`d4ba99e`) -- safe on its own, the roles snapshot loader is
+   inert until warp's master actually reads it. Confirm the digest was
+   cosign-verified in the release-image.yml run before recording it here
+   (see the comment above `LOOM_IMAGE` in `images.env`).
+2. On the host, as `loom_owner`, fill in the account UUIDs in
+   `staging/seed-obi148-roles.sql` and run it (command in the file's
+   header comment). This calls `roles_bootstrap_root` for the two roots
+   and `roles_set_tier`/`roles_set_member` for the alpha staff and
+   domains. Verify with the two `SELECT`s at the end of that file.
+3. Only then merge a `WARP_REF` bump to `a50a002` (or later `main`).
+   `mudlib-sync` resets the `mudlib` volume and the reconciler recreates
+   `loom` and `caddy` on its next run (up to 2 minutes).
+4. Verify: staff can log in and `roles <name>` shows their tier; run
+   `LOOM_SMOKE_DATABASE_URL=<staging loom_app url> tests/smoke.py tiers`
+   from a host/workstation that can reach the staging Postgres, or the
+   manual checks in OBI-148 (apprentice confinement, `promote`/`approve`
+   two-root round trip, one `role_changes` row, one `audit_log` row).
+
+**Rollback:** revert the `WARP_REF` bump commit first (per §7 -- this
+alone restores the Phase 0 allow-all master without touching the roles
+tables), then decide separately whether to also revert the `LOOM_IMAGE`
+bump. Do not delete the seeded roles rows as part of a rollback; they are
+harmless while the Phase 0 master is back in place and save re-seeding
+when `WARP_REF` moves forward again.
+
+## 10. Upgrades recreate the container, they don't restart the host
 
 A `LOOM_IMAGE` digest bump (merged `bump-staging.yml` PR, or a hand-edited
 `images.env` change) makes the next reconcile recreate **only** the `loom`
