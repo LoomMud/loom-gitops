@@ -1,0 +1,246 @@
+# SPDX-FileCopyrightText: 2026 Oberfield
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# D-P1.12 / OBI-42 restore drill, automated (OBI-164). Runs the "Local dry
+# run" from staging/RUNBOOK.md §6 in CI instead of on a workstation: no
+# real Azure account, no board credentials (OBI-109 is untouched), no
+# SSH to the staging host.
+#
+# What it proves, end to end, against an Azurite emulator container and a
+# throwaway `age` keypair generated fresh for the run:
+#   1. staging/backup.sh (unmodified, run the way the `backup` compose
+#      service runs it: a one-off BACKUP_IMAGE container on the same
+#      docker network as `postgres`) dumps a seeded row, encrypts it, and
+#      uploads it to the emulator.
+#   2. staging/restore.sh (unmodified) fetches that backup, decrypts it
+#      with the private half of the throwaway age key, restores it into a
+#      scratch `postgres:17-alpine` container, and runs its smoke query.
+#   3. The smoke query's row count matches what was seeded.
+#
+# Azurite's blob emulator always answers as `https://<account>.blob.core.
+# windows.net/...` requests would (both scripts hard-code that hostname
+# in their SAS URL -- intentionally not rewritten here, see the PR
+# description): a self-signed cert lets Azurite terminate TLS as that
+# hostname, `/etc/hosts` (for restore.sh and any host-side setup) and
+# `--add-host ...:host-gateway` (for the one-off backup container, which
+# doesn't share the runner's /etc/hosts) route that hostname to Azurite's
+# published port 443, and RCLONE_NO_CHECK_CERTIFICATE=true tells rclone
+# not to validate the self-signed cert -- all of that is CI plumbing, not
+# a change to either script.
+name: restore-drill
+on:
+  workflow_dispatch: {}
+  pull_request:
+    paths:
+      - staging/backup.sh
+      - staging/restore.sh
+      - staging/compose.yaml
+      - .github/workflows/restore-drill.yml
+  push:
+    branches: [main]
+    paths:
+      - staging/backup.sh
+      - staging/restore.sh
+      - staging/compose.yaml
+      - .github/workflows/restore-drill.yml
+permissions:
+  contents: read
+jobs:
+  restore-drill:
+    runs-on: ${{ (vars.CI_RUNS_ON && !github.event.pull_request.head.repo.fork) && (startsWith(vars.CI_RUNS_ON, '[') && fromJSON(vars.CI_RUNS_ON) || vars.CI_RUNS_ON) || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: install age
+        run: |
+          set -euo pipefail
+          version=1.2.1
+          workdir="$RUNNER_TEMP/age-install"
+          mkdir -p "$workdir"
+          curl -sSL "https://github.com/FiloSottile/age/releases/download/v${version}/age-v${version}-linux-amd64.tar.gz" -o "$workdir/age.tar.gz"
+          tar -xzf "$workdir/age.tar.gz" -C "$workdir"
+          sudo install -m 0755 "$workdir/age/age" /usr/local/bin/age
+          sudo install -m 0755 "$workdir/age/age-keygen" /usr/local/bin/age-keygen
+          age --version
+
+      # Throwaway keypair, generated fresh for this run only. The private
+      # key never leaves $RUNNER_TEMP (0600, never committed, never
+      # echoed); only the public recipient is captured into $GITHUB_ENV.
+      - name: generate throwaway age key
+        run: |
+          set -euo pipefail
+          key_file="$RUNNER_TEMP/drill-age-key.txt"
+          age-keygen -o "$key_file" 2>"$RUNNER_TEMP/age-keygen.stderr"
+          chmod 600 "$key_file"
+          private_key="$(grep '^AGE-SECRET-KEY-' "$key_file")"
+          echo "::add-mask::$private_key"
+          recipient="$(grep -o 'age1[a-z0-9]*' "$RUNNER_TEMP/age-keygen.stderr")"
+          rm -f "$RUNNER_TEMP/age-keygen.stderr"
+          echo "AGE_KEY_FILE=$key_file" >> "$GITHUB_ENV"
+          echo "AGE_RECIPIENT=$recipient" >> "$GITHUB_ENV"
+
+      # Self-signed cert so Azurite can terminate TLS as
+      # devstoreaccount1.blob.core.windows.net (backup.sh/restore.sh's
+      # hard-coded SAS host). Never trusted by anything outside this job;
+      # RCLONE_NO_CHECK_CERTIFICATE=true is what actually accepts it.
+      - name: generate throwaway TLS cert for Azurite
+        run: |
+          set -euo pipefail
+          echo "AZURITE_ACCOUNT=devstoreaccount1" >> "$GITHUB_ENV"
+          openssl req -x509 -nodes -newkey rsa:2048 -days 1 \
+            -keyout "$RUNNER_TEMP/azurite-key.pem" \
+            -out "$RUNNER_TEMP/azurite-cert.pem" \
+            -subj "/CN=devstoreaccount1.blob.core.windows.net" >/dev/null 2>&1
+
+      # Throwaway Azurite account key, generated fresh for this run only
+      # (AZURITE_ACCOUNTS, not the well-known published devstoreaccount1
+      # key, so nothing resembling a real secret pattern is ever
+      # committed or logged).
+      - name: start Azurite (blob emulator)
+        run: |
+          set -euo pipefail
+          azurite_key="$(openssl rand -base64 64 | tr -d '\n')"
+          echo "::add-mask::$azurite_key"
+          echo "AZURITE_KEY=$azurite_key" >> "$GITHUB_ENV"
+          docker run -d --name azurite \
+            -p 443:443 \
+            -e "AZURITE_ACCOUNTS=devstoreaccount1:${azurite_key}" \
+            -e AZURITE_SKIP_API_VERSION_CHECK=true \
+            -v "$RUNNER_TEMP/azurite-cert.pem:/cert.pem:ro" \
+            -v "$RUNNER_TEMP/azurite-key.pem:/key.pem:ro" \
+            mcr.microsoft.com/azure-storage/azurite@sha256:830430c1da1a2d537e08f3e6764dd1f5ae00cf0346bcaf625b968ec3f0971fd5 \
+            azurite-blob --blobHost 0.0.0.0 --blobPort 443 \
+            --cert /cert.pem --key /key.pem \
+            --skipApiVersionCheck --disableTelemetry
+          for i in $(seq 1 30); do
+            curl -sk --max-time 2 "https://127.0.0.1/devstoreaccount1" >/dev/null 2>&1 && break
+            sleep 1
+          done
+          # restore.sh/backup.sh's SAS URL is https://<account>.blob.core.
+          # windows.net/... -- route that hostname at the emulator for
+          # every host-side step (restore.sh itself, plus the setup below).
+          echo "127.0.0.1 devstoreaccount1.blob.core.windows.net" | sudo tee -a /etc/hosts >/dev/null
+
+      # Container creation needs SharedKey auth (a container-scoped SAS
+      # can't create the container it's scoped to); rclone's
+      # use_emulator mode does that locally against Azurite with
+      # path-style addressing, no hostname trick needed for this step.
+      - name: create throwaway container
+        env:
+          RCLONE_CONFIG_AZSETUP_TYPE: azureblob
+          RCLONE_CONFIG_AZSETUP_USE_EMULATOR: "true"
+          RCLONE_CONFIG_AZSETUP_ACCOUNT: devstoreaccount1
+          RCLONE_CONFIG_AZSETUP_KEY: ${{ env.AZURITE_KEY }}
+          RCLONE_CONFIG_AZSETUP_ENDPOINT: https://127.0.0.1/devstoreaccount1
+          RCLONE_NO_CHECK_CERTIFICATE: "true"
+        run: |
+          set -euo pipefail
+          version=1.68.2
+          workdir="$RUNNER_TEMP/rclone-install"
+          mkdir -p "$workdir"
+          curl -sSL "https://downloads.rclone.org/v${version}/rclone-v${version}-linux-amd64.zip" -o "$workdir/rclone.zip"
+          (cd "$workdir" && unzip -q rclone.zip)
+          sudo install -m 0755 "$workdir"/rclone-v${version}-linux-amd64/rclone /usr/local/bin/rclone
+          echo "AZURE_CONTAINER=loom-restore-drill-${{ github.run_id }}" >> "$GITHUB_ENV"
+          rclone mkdir "azsetup:loom-restore-drill-${{ github.run_id }}"
+
+      # Signing a container SAS is a pure local HMAC over the account
+      # key -- no network call, so the self-signed cert above is
+      # irrelevant here. rcwl (no delete), matching the real SAS policy
+      # backup.sh/restore.sh assume (SETUP.md §6.3, RUNBOOK.md §6).
+      - name: generate throwaway container SAS
+        run: |
+          set -euo pipefail
+          expiry="$(date -u -d '+2 hours' '+%Y-%m-%dT%H:%MZ')"
+          sas="$(docker run --rm -e AZURE_CORE_COLLECT_TELEMETRY=0 \
+            mcr.microsoft.com/azure-cli@sha256:e3768dde8142efa45d8f356a317aaac77abd7da15ba3719b0a150e9453f251db \
+            az storage container generate-sas --only-show-errors \
+            --account-name devstoreaccount1 --account-key "$AZURITE_KEY" \
+            --name "$AZURE_CONTAINER" --permissions rcwl --https-only \
+            --expiry "$expiry" -o tsv)"
+          echo "::add-mask::$sas"
+          echo "AZURE_SAS=$sas" >> "$GITHUB_ENV"
+
+      # Same postgres bring-up as ci.yml's compose-validate job (throwaway
+      # CI passwords, not staging/secrets.env.example's empty template).
+      - name: up -d postgres
+        env:
+          POSTGRES_SUPERUSER_PASSWORD: ci-throwaway-superuser-password
+          LOOM_OWNER_PASSWORD: ci-throwaway-owner-password
+          LOOM_APP_PASSWORD: ci-throwaway-app-password
+        run: |
+          set -euo pipefail
+          docker compose --env-file staging/images.env --env-file staging/secrets.env.example \
+            -f staging/compose.yaml up -d postgres
+          for i in $(seq 1 30); do
+            status=$(docker inspect -f '{{.State.Health.Status}}' "$(docker compose --env-file staging/images.env --env-file staging/secrets.env.example -f staging/compose.yaml ps -q postgres)")
+            [ "$status" = healthy ] && break
+            sleep 2
+          done
+          [ "$status" = healthy ] || { echo "postgres never became healthy"; docker compose --env-file staging/images.env --env-file staging/secrets.env.example -f staging/compose.yaml logs postgres; exit 1; }
+
+      - name: seed a known row
+        run: |
+          set -euo pipefail
+          pg_cid="$(docker compose --env-file staging/images.env --env-file staging/secrets.env.example -f staging/compose.yaml ps -q postgres)"
+          echo "PG_CID=$pg_cid" >> "$GITHUB_ENV"
+          docker exec -e PGPASSWORD=ci-throwaway-owner-password "$pg_cid" \
+            psql -U loom_owner -d loom -v ON_ERROR_STOP=1 -c \
+            "create table accounts (id serial primary key, note text); insert into accounts(note) values ('restore-drill-seed');"
+
+      # backup.sh itself (unmodified) run the way the `backup` compose
+      # service runs it (compose.yaml: image=BACKUP_IMAGE,
+      # entrypoint=/scripts/backup.sh) -- a one-off container on the same
+      # docker network as `postgres`, not `docker compose run` (this job
+      # never brought up the `backup` service's env from secrets.env, so
+      # the drill's throwaway values are passed directly instead).
+      - name: run staging/backup.sh against Azurite
+        run: |
+          set -euo pipefail
+          . staging/images.env
+          network="$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}' "$PG_CID")"
+          mkdir -p "$RUNNER_TEMP/mudlib-stub"
+          docker run --rm \
+            --network "$network" \
+            --add-host "devstoreaccount1.blob.core.windows.net:host-gateway" \
+            -e LOOM_OWNER_PASSWORD=ci-throwaway-owner-password \
+            -e AZURE_STORAGE_ACCOUNT=devstoreaccount1 \
+            -e AZURE_STORAGE_CONTAINER="$AZURE_CONTAINER" \
+            -e AZURE_STORAGE_SAS_TOKEN="$AZURE_SAS" \
+            -e BACKUP_AGE_RECIPIENT="$AGE_RECIPIENT" \
+            -e RCLONE_NO_CHECK_CERTIFICATE=true \
+            -v "$PWD/staging/backup.sh:/scripts/backup.sh:ro" \
+            -v "$RUNNER_TEMP/mudlib-stub:/mudlib:ro" \
+            "$BACKUP_IMAGE" /bin/sh /scripts/backup.sh | tee "$RUNNER_TEMP/backup.log"
+          grep -q '^.* backup: done: ' "$RUNNER_TEMP/backup.log"
+          # Mirrors backup.sh's own dow->prefix logic (RUNBOOK.md §6): the
+          # drill always restores whatever prefix this run's backup
+          # actually used, instead of hard-coding `daily` and going red
+          # every Sunday (UTC).
+          dow="$(date -u '+%u')"
+          prefix="daily"
+          [ "$dow" = "7" ] && prefix="weekly"
+          echo "PREFIX=$prefix" >> "$GITHUB_ENV"
+
+      - name: run staging/restore.sh from Azurite
+        env:
+          AZURE_STORAGE_ACCOUNT: devstoreaccount1
+          RCLONE_NO_CHECK_CERTIFICATE: "true"
+        run: |
+          set -euo pipefail
+          export AZURE_STORAGE_CONTAINER="$AZURE_CONTAINER"
+          export AZURE_STORAGE_SAS_TOKEN="$AZURE_SAS"
+          date="$(date -u '+%Y-%m-%d')"
+          staging/restore.sh --age-key "$AGE_KEY_FILE" --prefix "$PREFIX" --date "$date" \
+            | tee "$RUNNER_TEMP/restore.log"
+          grep -q 'restore drill OK' "$RUNNER_TEMP/restore.log"
+          count_line="$(awk '/^ accounts/{getline; getline; print; exit}' "$RUNNER_TEMP/restore.log" | tr -d ' ')"
+          [ "$count_line" = "1" ] || { echo "expected accounts count 1, got: '$count_line'"; exit 1; }
+          echo "restore drill smoke query: accounts=$count_line (expected 1, matches the seeded row)"
+
+      - name: cleanup
+        if: always()
+        run: |
+          docker compose --env-file staging/images.env --env-file staging/secrets.env.example -f staging/compose.yaml down -v || true
+          docker rm -f azurite || true
+          shred -u "$RUNNER_TEMP/drill-age-key.txt" 2>/dev/null || true

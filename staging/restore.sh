@@ -65,14 +65,19 @@ export RCLONE_CONFIG_LOOMBACKUP_SAS_URL="$sas_url"
 export RCLONE_CONFIG_LOOMBACKUP_NO_CHECK_CONTAINER=true
 
 log "listing ${PREFIX}/ for ${DATE}"
-dump_blob="$(rclone lsf "loombackup:/${PREFIX}/" | grep "^loom-${DATE//-/}" | sort | tail -1 || true)"
-mudlib_blob="$(rclone lsf "loombackup:/${PREFIX}/" | grep "^mudlib-${DATE//-/}" | sort | tail -1 || true)"
+# The container name must be repeated here even though sas_url already
+# scopes the remote to it (OBI-164, same issue/fix as backup.sh): rclone's
+# azureblob backend rejects a bare "loombackup:/${PREFIX}/" against a
+# container-scoped SAS URL ("container name in SAS URL ... and container
+# provided in command ... do not match").
+dump_blob="$(rclone lsf "loombackup:${AZURE_STORAGE_CONTAINER}/${PREFIX}/" | grep "^loom-${DATE//-/}" | sort | tail -1 || true)"
+mudlib_blob="$(rclone lsf "loombackup:${AZURE_STORAGE_CONTAINER}/${PREFIX}/" | grep "^mudlib-${DATE//-/}" | sort | tail -1 || true)"
 [ -n "$dump_blob" ] || { echo "no dump found for ${DATE} under ${PREFIX}/" >&2; exit 1; }
 [ -n "$mudlib_blob" ] || { echo "no mudlib tarball found for ${DATE} under ${PREFIX}/" >&2; exit 1; }
 
 log "fetching $dump_blob and $mudlib_blob"
-rclone copy "loombackup:/${PREFIX}/${dump_blob}" "$WORKDIR/"
-rclone copy "loombackup:/${PREFIX}/${mudlib_blob}" "$WORKDIR/"
+rclone copy "loombackup:${AZURE_STORAGE_CONTAINER}/${PREFIX}/${dump_blob}" "$WORKDIR/"
+rclone copy "loombackup:${AZURE_STORAGE_CONTAINER}/${PREFIX}/${mudlib_blob}" "$WORKDIR/"
 
 log "decrypting"
 age -d -i "$AGE_KEY" -o "$WORKDIR/loom.dump" "$WORKDIR/$dump_blob"
@@ -82,10 +87,32 @@ log "starting scratch postgres:17-alpine (not the real postgres service)"
 docker run -d --name "$CONTAINER_NAME" \
   -e POSTGRES_USER=loom -e POSTGRES_PASSWORD=restore-drill -e POSTGRES_DB=loom \
   postgres:17-alpine >/dev/null
-for _ in $(seq 1 30); do
-  docker exec "$CONTAINER_NAME" pg_isready -U loom -d loom >/dev/null 2>&1 && break
+# OBI-164: this used to be a bare pg_isready loop with no assertion after
+# it, AND pg_isready alone is the wrong check for a brand-new postgres
+# container: on first run the official image starts a *temporary*
+# instance to run initdb/init scripts, stops it, then starts the real
+# long-running one ("PostgreSQL init process complete; ready for start
+# up." in its logs marks that handoff) -- pg_isready can report success
+# against the temporary instance an instant before it's stopped, so a
+# single success is not enough. Found by the OBI-164 CI restore drill:
+# pg_isready succeeded, then pg_restore immediately failed with
+# "connection ... failed: No such file or directory" against the gap
+# where the temporary instance had already stopped and the real one
+# hadn't opened its socket yet.
+ready=""
+for _ in $(seq 1 60); do
+  if docker logs "$CONTAINER_NAME" 2>&1 | grep -q 'PostgreSQL init process complete; ready for start up' \
+      && docker exec "$CONTAINER_NAME" pg_isready -U loom -d loom >/dev/null 2>&1; then
+    ready=1
+    break
+  fi
   sleep 1
 done
+if [ -z "$ready" ]; then
+  echo "scratch postgres never became ready" >&2
+  docker logs "$CONTAINER_NAME" 2>&1 | tail -50 >&2
+  exit 1
+fi
 
 log "restoring"
 docker cp "$WORKDIR/loom.dump" "$CONTAINER_NAME:/tmp/loom.dump"

@@ -31,7 +31,15 @@ fi
 # The BACKUP_IMAGE base (staging/images.env) is plain Alpine: install the
 # three tools this script needs from Alpine's own repos. Idempotent
 # (apk add is a no-op if already present); network access required.
-apk add --no-cache postgresql16-client age rclone tar >/dev/null
+# postgresql17-client (not postgresql16-client, OBI-164): must match
+# POSTGRES_IMAGE's major version (postgres:17-alpine, staging/images.env)
+# -- pg_dump refuses to dump from a newer major server version
+# ("aborting because of server version mismatch"), found by the OBI-164
+# CI restore drill against a real postgres:17-alpine. BACKUP_IMAGE is
+# pinned to an Alpine release that carries postgresql17-client
+# (Alpine's own 16/17 packaging follows Postgres's release cadence, so
+# this pin moves in step with POSTGRES_IMAGE, not independently).
+apk add --no-cache postgresql17-client age rclone tar >/dev/null
 
 for cmd in pg_dump age rclone tar; do
   command -v "$cmd" >/dev/null 2>&1 || { log "FATAL: missing required command: $cmd"; exit 1; }
@@ -70,9 +78,17 @@ export RCLONE_CONFIG_LOOMBACKUP_SAS_URL="$sas_url"
 export RCLONE_CONFIG_LOOMBACKUP_NO_CHECK_CONTAINER=true
 
 log "uploading to ${prefix}/ (rclone copy, never sync/delete)"
+# The container name must be repeated here even though sas_url already
+# scopes the remote to it (OBI-164): rclone's azureblob backend parses
+# the first path segment after `remote:` as the target container and
+# rejects a container-scoped SAS URL whose container doesn't match it
+# ("container name in SAS URL ... and container provided in command ...
+# do not match"), so a bare "loombackup:/${prefix}/" always fails --
+# found by the OBI-164 CI restore drill, a real rclone against a real
+# container-scoped SAS, not by inspection.
 rclone copy \
-  "$WORKDIR/loom-${stamp}.dump.age" "loombackup:/${prefix}/" 2>&1 | sed 's/^/  /'
+  "$WORKDIR/loom-${stamp}.dump.age" "loombackup:${AZURE_STORAGE_CONTAINER}/${prefix}/" 2>&1 | sed 's/^/  /'
 rclone copy \
-  "$WORKDIR/mudlib-${stamp}.tar.age" "loombackup:/${prefix}/" 2>&1 | sed 's/^/  /'
+  "$WORKDIR/mudlib-${stamp}.tar.age" "loombackup:${AZURE_STORAGE_CONTAINER}/${prefix}/" 2>&1 | sed 's/^/  /'
 
 log "done: ${prefix}/loom-${stamp}.dump.age, ${prefix}/mudlib-${stamp}.tar.age"
