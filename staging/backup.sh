@@ -78,9 +78,17 @@ export RCLONE_CONFIG_LOOMBACKUP_SAS_URL="$sas_url"
 export RCLONE_CONFIG_LOOMBACKUP_NO_CHECK_CONTAINER=true
 
 log "uploading to ${prefix}/ (rclone copy, never sync/delete)"
+# The container name must be repeated here even though sas_url already
+# scopes the remote to it (OBI-164): rclone's azureblob backend parses
+# the first path segment after `remote:` as the target container and
+# rejects a container-scoped SAS URL whose container doesn't match it
+# ("container name in SAS URL ... and container provided in command ...
+# do not match"), so a bare "loombackup:/${prefix}/" always fails --
+# found by the OBI-164 CI restore drill, a real rclone against a real
+# container-scoped SAS, not by inspection.
 rclone copy \
-  "$WORKDIR/loom-${stamp}.dump.age" "loombackup:/${prefix}/" 2>&1 | sed 's/^/  /'
+  "$WORKDIR/loom-${stamp}.dump.age" "loombackup:${AZURE_STORAGE_CONTAINER}/${prefix}/" 2>&1 | sed 's/^/  /'
 rclone copy \
-  "$WORKDIR/mudlib-${stamp}.tar.age" "loombackup:/${prefix}/" 2>&1 | sed 's/^/  /'
+  "$WORKDIR/mudlib-${stamp}.tar.age" "loombackup:${AZURE_STORAGE_CONTAINER}/${prefix}/" 2>&1 | sed 's/^/  /'
 
 log "done: ${prefix}/loom-${stamp}.dump.age, ${prefix}/mudlib-${stamp}.tar.age"

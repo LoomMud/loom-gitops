@@ -65,14 +65,19 @@ export RCLONE_CONFIG_LOOMBACKUP_SAS_URL="$sas_url"
 export RCLONE_CONFIG_LOOMBACKUP_NO_CHECK_CONTAINER=true
 
 log "listing ${PREFIX}/ for ${DATE}"
-dump_blob="$(rclone lsf "loombackup:/${PREFIX}/" | grep "^loom-${DATE//-/}" | sort | tail -1 || true)"
-mudlib_blob="$(rclone lsf "loombackup:/${PREFIX}/" | grep "^mudlib-${DATE//-/}" | sort | tail -1 || true)"
+# The container name must be repeated here even though sas_url already
+# scopes the remote to it (OBI-164, same issue/fix as backup.sh): rclone's
+# azureblob backend rejects a bare "loombackup:/${PREFIX}/" against a
+# container-scoped SAS URL ("container name in SAS URL ... and container
+# provided in command ... do not match").
+dump_blob="$(rclone lsf "loombackup:${AZURE_STORAGE_CONTAINER}/${PREFIX}/" | grep "^loom-${DATE//-/}" | sort | tail -1 || true)"
+mudlib_blob="$(rclone lsf "loombackup:${AZURE_STORAGE_CONTAINER}/${PREFIX}/" | grep "^mudlib-${DATE//-/}" | sort | tail -1 || true)"
 [ -n "$dump_blob" ] || { echo "no dump found for ${DATE} under ${PREFIX}/" >&2; exit 1; }
 [ -n "$mudlib_blob" ] || { echo "no mudlib tarball found for ${DATE} under ${PREFIX}/" >&2; exit 1; }
 
 log "fetching $dump_blob and $mudlib_blob"
-rclone copy "loombackup:/${PREFIX}/${dump_blob}" "$WORKDIR/"
-rclone copy "loombackup:/${PREFIX}/${mudlib_blob}" "$WORKDIR/"
+rclone copy "loombackup:${AZURE_STORAGE_CONTAINER}/${PREFIX}/${dump_blob}" "$WORKDIR/"
+rclone copy "loombackup:${AZURE_STORAGE_CONTAINER}/${PREFIX}/${mudlib_blob}" "$WORKDIR/"
 
 log "decrypting"
 age -d -i "$AGE_KEY" -o "$WORKDIR/loom.dump" "$WORKDIR/$dump_blob"
