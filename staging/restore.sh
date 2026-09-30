@@ -87,10 +87,26 @@ log "starting scratch postgres:17-alpine (not the real postgres service)"
 docker run -d --name "$CONTAINER_NAME" \
   -e POSTGRES_USER=loom -e POSTGRES_PASSWORD=restore-drill -e POSTGRES_DB=loom \
   postgres:17-alpine >/dev/null
+# OBI-164: this loop used to have no assertion after it -- if the scratch
+# container was still starting up after 30s (slow pull, slow initdb, a
+# busy CI runner), the script fell straight through into pg_restore
+# against a target that wasn't listening yet, failing on a confusing
+# "connection ... failed: No such file or directory" instead of a clear
+# readiness error. Found by the OBI-164 CI restore drill (not
+# consistently reproducible locally -- it's a race, not a hard failure).
+ready=""
 for _ in $(seq 1 30); do
-  docker exec "$CONTAINER_NAME" pg_isready -U loom -d loom >/dev/null 2>&1 && break
+  if docker exec "$CONTAINER_NAME" pg_isready -U loom -d loom >/dev/null 2>&1; then
+    ready=1
+    break
+  fi
   sleep 1
 done
+if [ -z "$ready" ]; then
+  echo "scratch postgres never became ready" >&2
+  docker logs "$CONTAINER_NAME" 2>&1 | tail -50 >&2
+  exit 1
+fi
 
 log "restoring"
 docker cp "$WORKDIR/loom.dump" "$CONTAINER_NAME:/tmp/loom.dump"
