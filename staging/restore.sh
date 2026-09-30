@@ -101,7 +101,7 @@ docker run -d --name "$CONTAINER_NAME" \
 # hadn't opened its socket yet.
 ready=""
 for _ in $(seq 1 60); do
-  if docker logs "$CONTAINER_NAME" 2>&1 | grep -q 'PostgreSQL init process complete; ready for start up\|database system is ready to accept connections' \
+  if docker logs "$CONTAINER_NAME" 2>&1 | grep -q 'PostgreSQL init process complete; ready for start up' \
       && docker exec "$CONTAINER_NAME" pg_isready -U loom -d loom >/dev/null 2>&1; then
     ready=1
     break
