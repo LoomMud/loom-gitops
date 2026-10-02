@@ -107,10 +107,20 @@ Blob backups are configured and have at least one nightly run:
 2. `sudo /opt/loom-gitops/staging/bootstrap.sh`. This brings up `loom` with
    an **empty** `pgdata` volume (a fresh `postgres:17-alpine` container) --
    accounts and world state are gone until you restore.
-3. Run the restore drill (§5 below) against the **real** bucket and the
-   **real** age private key, restoring into the actual `postgres` service
-   this time (not a scratch container): stop `loom`, `pg_restore` into the
-   running `postgres` container, restart `loom`.
+3. **Pause the reconciler first:** `loom-reconcile.timer` runs `docker
+   compose up -d` every 2 minutes (D-P1.8) and will happily restart `loom`
+   partway through this step or step 5 if you leave it running --
+   `up -d` with no compose.yaml/image change just brings a stopped `loom`
+   back by itself.
+   ```bash
+   sudo systemctl stop loom-reconcile.timer
+   ```
+   Restore postgres and saves in the **same** stop window (steps 3-5
+   below), then restart the timer at the end of step 5.
+4. Restore the Postgres dump against the **real** bucket and the **real**
+   age private key, restoring into the actual `postgres` service this
+   time (not a scratch container): stop `loom`, `pg_restore` into the
+   running `postgres` container, leave `loom` stopped for step 5.
    ```bash
    sudo docker compose --project-directory /opt/loom-gitops/staging \
      --env-file /opt/loom-gitops/staging/images.env --env-file /etc/loom/secrets.env \
@@ -119,31 +129,28 @@ Blob backups are configured and have at least one nightly run:
    # container (adapt staging/restore.sh's docker-cp/pg_restore lines --
    # this is the one drill step that intentionally does NOT use a scratch
    # container, because the point here is to repopulate the real one).
-   sudo docker compose --project-directory /opt/loom-gitops/staging \
-     --env-file /opt/loom-gitops/staging/images.env --env-file /etc/loom/secrets.env \
-     -f /opt/loom-gitops/staging/compose.yaml start loom
    ```
-4. Untar the mudlib backup over the `mudlib` volume if `mudlib-sync`'s
+5. Untar the mudlib backup over the `mudlib` volume if `mudlib-sync`'s
    pinned `WARP_REF` no longer exists upstream; otherwise `mudlib-sync`
    already repopulated it from `staging/images.env`'s `WARP_REPO`/`WARP_REF`
    in step 2, and the tarball is only needed for anything not in that ref
    (there shouldn't be any -- the mudlib volume is git-sourced by design).
-5. Restore character saves (OBI-172/OBI-241): `staging/restore.sh` fetches
+6. Restore character saves (OBI-172/OBI-241): `staging/restore.sh` fetches
    and decrypts the saves tarball for you as part of the drill above, but
-   writes it into a volume named by `--saves-volume` (default `saves`),
-   not the real one `loom` mounts. The real volume is project-prefixed by
-   compose (`compose.yaml`'s top-level `name: loom`), so point it there
-   explicitly and stop `loom` first (same reasoning as step 3 -- restoring
-   into a volume a running container has open invites surprises):
+   writes it into a volume named by `--saves-volume` if given, or
+   otherwise a temporary scratch volume removed on exit (see §6). The
+   real volume is project-prefixed by compose (`compose.yaml`'s top-level
+   `name: loom`), so point `--saves-volume` there explicitly. `loom` is
+   already stopped from step 4 -- restore.sh itself refuses to write into
+   a volume a running container has mounted, but that's a backstop, not a
+   reason to skip stopping it:
    ```bash
-   sudo docker compose --project-directory /opt/loom-gitops/staging \
-     --env-file /opt/loom-gitops/staging/images.env --env-file /etc/loom/secrets.env \
-     -f /opt/loom-gitops/staging/compose.yaml stop loom
    staging/restore.sh --age-key /path/to/loom-backup.agekey --prefix daily \
      --date 2026-10-01 --saves-volume loom_saves
    sudo docker compose --project-directory /opt/loom-gitops/staging \
      --env-file /opt/loom-gitops/staging/images.env --env-file /etc/loom/secrets.env \
      -f /opt/loom-gitops/staging/compose.yaml start loom
+   sudo systemctl start loom-reconcile.timer
    ```
    This overwrites files already in `loom_saves` with the ones from the
    tarball (tar doesn't delete anything *not* in the tarball); it chowns
@@ -160,11 +167,13 @@ staging/restore.sh --age-key /path/to/loom-backup.agekey --prefix daily --date 2
 ```
 
 This also fetches, decrypts and restores the saves tarball (OBI-172/
-OBI-241) into a docker volume named `saves` by default -- pass
-`--saves-volume <name>` to target a different one (the real deploy's is
-`loom_saves`, per step 5 above; the default is deliberately **not** that
-name, so a routine drill run never touches the real volume by accident).
-```
+OBI-241) into a docker volume -- by default a disposable scratch volume
+this script creates and removes on exit, so a routine drill run never
+touches anything persistent. Pass `--saves-volume <name>` to target a
+real one instead (the real deploy's is `loom_saves`, per §5 step 6
+above);
+an explicitly-named volume is never deleted by this script, and it
+refuses to restore into one a running container still has mounted.
 
 This fetches the three blobs for that date (postgres dump, mudlib
 tarball, saves tarball), decrypts them with the age
