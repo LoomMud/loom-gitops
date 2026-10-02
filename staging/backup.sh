@@ -22,9 +22,40 @@ set -eu
 
 log() { printf '%s backup: %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"; }
 
+# OBI-175 (P2-O4): a one-line status (success|failure|disabled plus a
+# timestamp), written on every run. compose.yaml bind-mounts the same
+# ./alerts-state directory into this service and into the `alerts`
+# one-shot, so alerts.sh's check_backup can read it without a shared
+# database or message bus. Best-effort: a write failure here (missing
+# mount, read-only fs) must never fail the backup itself.
+STATUS_FILE="${LOOM_ALERTS_BACKUP_STATUS_FILE:-/alerts-state/backup-status}"
+write_status() {
+  mkdir -p "$(dirname "$STATUS_FILE")" 2>/dev/null || return 0
+  printf '%s %s\n' "$1" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" > "$STATUS_FILE" 2>/dev/null || true
+}
+# EXIT trap, not ERR: `/bin/sh` on the BACKUP_IMAGE base is busybox ash
+# (Alpine), which doesn't support `trap ... ERR` (a bash/ksh extension) --
+# an EXIT trap that inspects $? works on every POSIX shell. STATUS
+# (below) is set explicitly on the two intentional `exit 0` paths
+# (disabled, success) so the trap is a no-op there; it only fires
+# "failure" when `set -e` kills the script somewhere unexpected.
+STATUS=""
+WORKDIR=""
+on_exit() {
+  rc=$?
+  [ -n "$WORKDIR" ] && rm -rf "$WORKDIR"
+  if [ -n "$STATUS" ]; then
+    write_status "$STATUS"
+  elif [ "$rc" -ne 0 ]; then
+    write_status failure
+  fi
+}
+trap on_exit EXIT
+
 if [ -z "${AZURE_STORAGE_ACCOUNT:-}" ] || [ -z "${AZURE_STORAGE_CONTAINER:-}" ] || \
    [ -z "${AZURE_STORAGE_SAS_TOKEN:-}" ] || [ -z "${BACKUP_AGE_RECIPIENT:-}" ]; then
   log "backups not configured (AZURE_STORAGE_*/BACKUP_AGE_RECIPIENT unset) -- no-op, see OBI-109"
+  STATUS=disabled
   exit 0
 fi
 
@@ -46,7 +77,6 @@ for cmd in pg_dump age rclone tar; do
 done
 
 WORKDIR="$(mktemp -d)"
-trap 'rm -rf "$WORKDIR"' EXIT
 
 stamp="$(date -u '+%Y%m%d-%H%M%S')"
 dow="$(date -u '+%u')"  # 1=Monday .. 7=Sunday
@@ -92,3 +122,4 @@ rclone copy \
   "$WORKDIR/mudlib-${stamp}.tar.age" "loombackup:${AZURE_STORAGE_CONTAINER}/${prefix}/" 2>&1 | sed 's/^/  /'
 
 log "done: ${prefix}/loom-${stamp}.dump.age, ${prefix}/mudlib-${stamp}.tar.age"
+STATUS=success

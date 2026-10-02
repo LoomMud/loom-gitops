@@ -60,16 +60,22 @@ file_perms="$(stat -c '%U:%G %a' "$SECRETS_FILE")"
 for required in POSTGRES_SUPERUSER_PASSWORD LOOM_OWNER_PASSWORD LOOM_APP_PASSWORD GITHUB_STATUS_TOKEN; do
   grep -q "^${required}=." "$SECRETS_FILE" || fatal "$SECRETS_FILE is missing a value for $required"
 done
+if ! grep -q '^GITHUB_ALERTS_TOKEN=.' "$SECRETS_FILE" 2>/dev/null; then
+  log "WARNING: GITHUB_ALERTS_TOKEN not set in $SECRETS_FILE -- loom-alerts.timer will run but every check that fires will only log a warning instead of opening a GitHub issue (SETUP.md §8.1b, OBI-175)"
+fi
 log "secrets.env present with correct ownership/mode"
 
-log "3/5 installing systemd units (reconciler + backup, User=loom)"
+log "3/5 installing systemd units (reconciler + backup + alerts, User=loom)"
 install -o root -g root -m 0644 "$SCRIPT_DIR/systemd/loom-reconcile.service" "$SYSTEMD_DIR/"
 install -o root -g root -m 0644 "$SCRIPT_DIR/systemd/loom-reconcile.timer" "$SYSTEMD_DIR/"
 install -o root -g root -m 0644 "$SCRIPT_DIR/systemd/loom-backup.service" "$SYSTEMD_DIR/"
 install -o root -g root -m 0644 "$SCRIPT_DIR/systemd/loom-backup.timer" "$SYSTEMD_DIR/"
+install -o root -g root -m 0644 "$SCRIPT_DIR/systemd/loom-alerts.service" "$SYSTEMD_DIR/"
+install -o root -g root -m 0644 "$SCRIPT_DIR/systemd/loom-alerts.timer" "$SYSTEMD_DIR/"
 systemctl daemon-reload
 systemctl enable --now loom-reconcile.timer
 systemctl enable loom-backup.timer
+systemctl enable --now loom-alerts.timer
 if grep -q '^AZURE_STORAGE_ACCOUNT=.' "$SECRETS_FILE" 2>/dev/null; then
   systemctl start loom-backup.timer
   log "loom-backup.timer started (Azure Blob config present)"
