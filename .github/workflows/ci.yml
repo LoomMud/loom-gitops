@@ -163,3 +163,148 @@ jobs:
         run: |
           . staging/images.env
           docker pull "$LOOM_IMAGE" && echo "LOOM_IMAGE is pullable" || echo "LOOM_IMAGE pull failed (expected while GHCR package is private, OBI-109)"
+
+  # OBI-175 (P2-O4): exercises staging/alerts.sh's three self-contained
+  # detection paths (readyz-down timer, backup-status parsing, error-rate
+  # math) with LOOM_ALERTS_DRY_RUN=1, so no GitHub token is needed and
+  # nothing is ever delivered from CI. It proves the detection logic, not
+  # delivery -- delivery (opening/closing a real GitHub issue) and the
+  # fourth check (reconcile, which reads a live commit status and isn't
+  # worth faking deterministically here) were fired on purpose by hand
+  # against LoomMud/loom-gitops and are recorded on OBI-175, since this
+  # repo's CI runner has no staging host to fire from live.
+  alerts-dry-run:
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_RUNS_ON && (startsWith(vars.CI_RUNS_ON, '[') && fromJSON(vars.CI_RUNS_ON) || vars.CI_RUNS_ON) || 'arc-runner-set-loommud' }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: start a stub HTTP server for /readyz and /metrics
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' &
+          import http.server
+          class H(http.server.BaseHTTPRequestHandler):
+              def do_GET(self):
+                  if self.path == "/readyz":
+                      self.send_response(200); self.end_headers(); self.wfile.write(b"ok")
+                  elif self.path == "/metrics":
+                      self.send_response(200); self.end_headers()
+                      self.wfile.write(b"loom_runtime_errors_total 100\n")
+                  else:
+                      self.send_response(404); self.end_headers()
+              def log_message(self, *a): pass
+          http.server.HTTPServer(("127.0.0.1", 18999), H).serve_forever()
+          PY
+          sleep 1
+          curl -fsS http://127.0.0.1:18999/readyz
+      - name: readyz check -- down, not yet over threshold
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/alerts-ci
+          LOOM_ALERTS_DRY_RUN=1 LOOM_ALERTS_STATE_DIR=/tmp/alerts-ci \
+            LOOM_ALERTS_LOOM_HTTP_BASE=http://127.0.0.1:1 \
+            sh staging/alerts.sh 2>&1 | tee /tmp/alerts-ci.log
+          grep -q "starting timer" /tmp/alerts-ci.log
+          [ -f /tmp/alerts-ci/readyz-down-since ]
+      - name: readyz check -- over threshold, fires (dry-run)
+        run: |
+          set -euo pipefail
+          echo $(( $(date +%s) - 130 )) > /tmp/alerts-ci/readyz-down-since
+          LOOM_ALERTS_DRY_RUN=1 LOOM_ALERTS_STATE_DIR=/tmp/alerts-ci \
+            LOOM_ALERTS_LOOM_HTTP_BASE=http://127.0.0.1:1 \
+            sh staging/alerts.sh 2>&1 | tee /tmp/alerts-ci.log
+          grep -q "\[dry-run\] would fire 'readyz'" /tmp/alerts-ci.log
+      - name: readyz check -- recovers, resolves (dry-run)
+        run: |
+          set -euo pipefail
+          LOOM_ALERTS_DRY_RUN=1 LOOM_ALERTS_STATE_DIR=/tmp/alerts-ci \
+            LOOM_ALERTS_LOOM_HTTP_BASE=http://127.0.0.1:18999 \
+            sh staging/alerts.sh 2>&1 | tee /tmp/alerts-ci.log
+          grep -q "\[dry-run\] would resolve 'readyz'" /tmp/alerts-ci.log
+          [ ! -f /tmp/alerts-ci/readyz-down-since ]
+      - name: backup check -- failure then resolve (dry-run)
+        run: |
+          set -euo pipefail
+          echo "failure $(date -u '+%Y-%m-%dT%H:%M:%SZ')" > /tmp/alerts-ci/backup-status
+          LOOM_ALERTS_DRY_RUN=1 LOOM_ALERTS_STATE_DIR=/tmp/alerts-ci \
+            LOOM_ALERTS_LOOM_HTTP_BASE=http://127.0.0.1:18999 \
+            sh staging/alerts.sh 2>&1 | tee /tmp/alerts-ci.log
+          grep -q "\[dry-run\] would fire 'backup'" /tmp/alerts-ci.log
+          echo "success $(date -u '+%Y-%m-%dT%H:%M:%SZ')" > /tmp/alerts-ci/backup-status
+          LOOM_ALERTS_DRY_RUN=1 LOOM_ALERTS_STATE_DIR=/tmp/alerts-ci \
+            LOOM_ALERTS_LOOM_HTTP_BASE=http://127.0.0.1:18999 \
+            sh staging/alerts.sh 2>&1 | tee /tmp/alerts-ci.log
+          grep -q "\[dry-run\] would resolve 'backup'" /tmp/alerts-ci.log
+      - name: error-rate check -- metric present, over threshold, fires (dry-run)
+        run: |
+          set -euo pipefail
+          echo "$(( $(date +%s) - 5 )) 0" > /tmp/alerts-ci/error-rate-prev
+          LOOM_ALERTS_DRY_RUN=1 LOOM_ALERTS_STATE_DIR=/tmp/alerts-ci \
+            LOOM_ALERTS_LOOM_HTTP_BASE=http://127.0.0.1:18999 \
+            LOOM_ALERTS_ERROR_RATE_THRESHOLD=1 \
+            sh staging/alerts.sh 2>&1 | tee /tmp/alerts-ci.log
+          grep -q "\[dry-run\] would fire 'error_rate'" /tmp/alerts-ci.log
+      - name: error-rate check -- metric absent, skips cleanly (no OBI-169 yet)
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/alerts-ci2; mkdir -p /tmp/alerts-ci2
+          python3 - <<'PY' &
+          import http.server
+          class H(http.server.BaseHTTPRequestHandler):
+              def do_GET(self):
+                  self.send_response(200); self.end_headers()
+                  if self.path == "/readyz": self.wfile.write(b"ok")
+              def log_message(self, *a): pass
+          http.server.HTTPServer(("127.0.0.1", 18998), H).serve_forever()
+          PY
+          sleep 1
+          LOOM_ALERTS_DRY_RUN=1 LOOM_ALERTS_STATE_DIR=/tmp/alerts-ci2 \
+            LOOM_ALERTS_LOOM_HTTP_BASE=http://127.0.0.1:18998 \
+            sh staging/alerts.sh 2>&1 | tee /tmp/alerts-ci2.log
+          grep -q "not present yet (OBI-169/P2-B4 not landed)" /tmp/alerts-ci2.log
+      - name: error-rate check -- ignores the Prometheus client's auto _created series (CTO review item 4)
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/alerts-ci3; mkdir -p /tmp/alerts-ci3
+          python3 - <<'PY' &
+          import http.server
+          class H(http.server.BaseHTTPRequestHandler):
+              def do_GET(self):
+                  if self.path == "/readyz":
+                      self.send_response(200); self.end_headers(); self.wfile.write(b"ok")
+                  elif self.path == "/metrics":
+                      self.send_response(200); self.end_headers()
+                      # _created carries a huge, unrelated epoch-seconds value
+                      # (as the Prometheus client libs emit); a naive
+                      # `grep "^metric"` match would misread this as the
+                      # counter itself and report a bogus rate.
+                      self.wfile.write(b"loom_runtime_errors_total_created 1700000000\nloom_runtime_errors_total 10\n")
+                  else:
+                      self.send_response(404); self.end_headers()
+              def log_message(self, *a): pass
+          http.server.HTTPServer(("127.0.0.1", 18997), H).serve_forever()
+          PY
+          sleep 1
+          echo "$(( $(date +%s) - 5 )) 5" > /tmp/alerts-ci3/error-rate-prev
+          LOOM_ALERTS_DRY_RUN=1 LOOM_ALERTS_STATE_DIR=/tmp/alerts-ci3 \
+            LOOM_ALERTS_LOOM_HTTP_BASE=http://127.0.0.1:18997 \
+            LOOM_ALERTS_ERROR_RATE_THRESHOLD=0.1 \
+            sh staging/alerts.sh 2>&1 | tee /tmp/alerts-ci3.log
+          # 10 - 5 over >=5s is at most 1/s (less if the pass is slow, e.g.
+          # the reconcile check's GitHub call), over the 0.1/s threshold --
+          # fires. If _created's huge value leaked into the sum this would be
+          # wildly higher and still "fire", so also assert the rate is <= 1/s,
+          # not a value in the millions. Not an exact value: wall-clock
+          # elapsed time varies run to run.
+          grep -q "\[dry-run\] would fire 'error_rate'" /tmp/alerts-ci3.log
+          grep -Eq "rate is (0\.[0-9]{4}|1\.0000)/s" /tmp/alerts-ci3.log
+      - name: backup check -- stale status fires even though it still says success (CTO review item 3)
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/alerts-ci4; mkdir -p /tmp/alerts-ci4
+          echo "success $(date -u '+%Y-%m-%dT%H:%M:%SZ')" > /tmp/alerts-ci4/backup-status
+          touch -d '27 hours ago' /tmp/alerts-ci4/backup-status
+          LOOM_ALERTS_DRY_RUN=1 LOOM_ALERTS_STATE_DIR=/tmp/alerts-ci4 \
+            LOOM_ALERTS_LOOM_HTTP_BASE=http://127.0.0.1:18999 \
+            sh staging/alerts.sh 2>&1 | tee /tmp/alerts-ci4.log
+          grep -q "\[dry-run\] would fire 'backup'" /tmp/alerts-ci4.log
+          grep -q "status is stale" /tmp/alerts-ci4.log

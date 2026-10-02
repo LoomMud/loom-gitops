@@ -22,8 +22,11 @@ sudoedit /etc/loom/secrets.env
 
 Fill in at least `POSTGRES_SUPERUSER_PASSWORD`, `LOOM_OWNER_PASSWORD`,
 `LOOM_APP_PASSWORD` (each its own `openssl rand -hex 24`, OBI-130 DB role
-separation -- see `secrets.env.example` for what each login is for) and
-`GITHUB_STATUS_TOKEN` (SETUP.md §8.1). Leave the `AZURE_STORAGE_*` and
+separation -- see `secrets.env.example` for what each login is for),
+`GITHUB_STATUS_TOKEN` (SETUP.md §8.1) and `GITHUB_ALERTS_TOKEN`
+(SETUP.md §8.1b, OBI-175 -- a separately-scoped token for the alerting
+timer in §9 below; loom-alerts.timer runs and logs without it, it just
+doesn't deliver anything). Leave the `AZURE_STORAGE_*` and
 `GHCR_TOKEN` lines commented out until they're provisioned (OBI-109);
 `staging/backup.sh` and `staging/reconcile.sh` both tolerate that as a
 documented no-op, not a failure.
@@ -37,11 +40,11 @@ Never `cat` this file to a shared screen or paste its contents anywhere.
 sudo /opt/loom-gitops/staging/bootstrap.sh
 ```
 
-This installs `loom-reconcile.service`/`.timer` (every 2 min) and
+This installs `loom-reconcile.service`/`.timer` (every 2 min),
 `loom-backup.service`/`.timer` (nightly, 02:30 UTC -- 2h clear of the
-04:30 UTC unattended-upgrade reboot window), both `User=loom`, then runs
-the reconciler once synchronously so first-boot failures are visible
-immediately. It refuses to proceed (rather than silently fixing things) if
+04:30 UTC unattended-upgrade reboot window) and `loom-alerts.service`/`.timer`
+(every minute, OBI-175), all `User=loom`, then runs the reconciler once
+synchronously so first-boot failures are visible immediately. It refuses to proceed (rather than silently fixing things) if
 `/etc/loom`/`secrets.env` have the wrong owner/mode, or if
 `/opt/loom-gitops` isn't already owned by `loom`.
 
@@ -247,3 +250,92 @@ a `telnet localhost 4000` session is logged in and has, say, walked
 somewhere or set a variable, then reconnect after the recreate and
 confirm the character (location, any state set) persisted. See the OBI-42
 issue for a recorded run of this drill.
+
+## 11. Alerting (OBI-175/P2-O4)
+
+Retro R3: a 68-minute staging outage on 09-28 went unnoticed because the
+only failure signal was a GitHub commit status (`staging/reconcile`,
+§8/§D1 above) nobody was watching live. `loom-alerts.timer` runs
+`staging/alerts.sh` every minute (`docker compose --profile alerts run
+--rm alerts`, on the same compose network as `loom`, so it can reach
+`loom:8080` directly) and pushes a failure to the channel this team
+already watches: **a GitHub issue, labeled `alert`, in
+`LoomMud/loom-gitops`**. It opens one on the transition into "firing",
+comments on it (throttled to once per 15 minutes) while the condition
+keeps firing, and closes it on recovery. Needs `GITHUB_ALERTS_TOKEN` in
+`secrets.env` (SETUP.md §8.1b) to actually deliver anything -- without
+it, every check still runs and logs to `journalctl -u
+loom-alerts.service`, it just doesn't open/update an issue.
+
+Four checks, each independent:
+
+| Alert | Condition | Source |
+|---|---|---|
+| `reconcile` | `staging/reconcile` commit status on `origin/main` is `failure`/`error` | GitHub commits API (unauthenticated read; public repo) |
+| `readyz` | `GET http://loom:8080/readyz` has not returned `200` for >= 120s (`LOOM_ALERTS_READYZ_THRESHOLD_SECS`) | direct check against `loom`'s internal HTTP port |
+| `backup` | `backup.sh`'s last run wrote `failure` to `./alerts-state/backup-status` | shared bind mount between the `backup` and `alerts` services |
+| `error_rate` | the counter `loom_runtime_errors_total` (`LOOM_ALERTS_ERROR_METRIC`) increases faster than `LOOM_ALERTS_ERROR_RATE_THRESHOLD` (default 1/s, a placeholder) | `loom`'s `/metrics` |
+
+**These are all on-host checks and cannot see a host outage** (the host
+itself down, Docker dead, or the compose network unreachable): all four
+run as `docker compose --profile alerts run --rm alerts` on the same
+host they're checking, so if the host is down, nothing runs `alerts.sh`
+at all and no alert fires for that. An off-host probe (pinging the host
+from somewhere else entirely) is filed separately as
+[OBI-196](https://github.com/LoomMud/loom-gitops/issues/196), not yet
+built. Until then, a total host outage is this alerting system's blind
+spot.
+
+**`error_rate` is wired but inert until OBI-169 (P2-B4, the error inbox)
+lands and exports that counter.** Until then, `alerts.sh` logs a skip
+every run ("metric not present yet") and never fires. Once OBI-169 ships,
+confirm the metric name matches `LOOM_ALERTS_ERROR_METRIC` (override it
+in `secrets.env` or the service's `environment:` if it doesn't) and pick
+a real threshold with Aragorn/Gimli instead of the placeholder `1/s`,
+then fire it once on purpose the same way as the other three (below) and
+record the issue link on OBI-175.
+
+### Fire each one on purpose
+
+```bash
+compose() {
+  docker compose --project-directory /opt/loom-gitops/staging \
+    --env-file /opt/loom-gitops/staging/images.env --env-file /etc/loom/secrets.env \
+    -f /opt/loom-gitops/staging/compose.yaml "$@"
+}
+
+# reconcile: there is no safe way to make a real staging/reconcile run
+# fail on purpose without actually breaking the stack, so prove this one
+# by pointing LOOM_ALERTS_RECONCILE_SHA at a commit you know carries a
+# failure status (or temporarily post one by hand with GITHUB_STATUS_TOKEN,
+# the same curl reconcile.sh itself uses, then revert it).
+compose --profile alerts run --rm \
+  -e LOOM_ALERTS_RECONCILE_SHA=<sha with a failure status> \
+  alerts
+
+# readyz: stop loom so /readyz stops answering, run alerts.sh past the
+# 2-minute threshold (twice, >=120s apart), then restart it.
+compose stop loom
+compose --profile alerts run --rm alerts   # starts the down-since timer
+sleep 130
+compose --profile alerts run --rm alerts   # fires (opens the issue)
+compose start loom
+compose --profile alerts run --rm alerts   # resolves (closes the issue)
+
+# backup: write a failure status by hand, run alerts.sh, then clear it.
+echo "failure $(date -u '+%Y-%m-%dT%H:%M:%SZ')" > /opt/loom-gitops/staging/alerts-state/backup-status
+compose --profile alerts run --rm alerts
+echo "success $(date -u '+%Y-%m-%dT%H:%M:%SZ')" > /opt/loom-gitops/staging/alerts-state/backup-status
+compose --profile alerts run --rm alerts
+```
+
+Evidence for each firing (the opened/closed issue URL, plus the relevant
+`journalctl -u loom-alerts.service` lines) belongs in OBI-175, not here.
+
+### Local dry run (no GitHub token, no staging host)
+
+`LOOM_ALERTS_DRY_RUN=1` makes `alerts.sh` log what it would fire/resolve
+instead of calling the GitHub API -- useful for checking the detection
+logic (readyz timer math, backup status parsing) without a token or a
+real repo. See `.github/workflows/ci.yml`'s `alerts-dry-run` job for a
+worked example against a throwaway HTTP stub instead of a real `loom`.

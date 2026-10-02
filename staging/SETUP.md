@@ -40,7 +40,7 @@ Items marked **TBD-by-R6** depend on files R6 (OBI-42) has not shipped yet. Do n
 | 3. Firewall: 4000/80/443 in, SSH for admins only, rest closed | §3.2 SSH hardening, §4 Firewall |
 | 4. Backup bucket, scoped key, ~90-day lifecycle | §6 Backup storage (Azure Blob) |
 | 5. age keypair, private key offline, post public key | §7 age keypair |
-| 6. GitHub fine-grained token (commit statuses only) | §8.1 GitHub token |
+| 6. GitHub fine-grained tokens (commit statuses; alerting issues) | §8.1, §8.1b GitHub tokens |
 | 7. GHCR public (fallback `read:packages` token) | §8.2 GHCR |
 | 8. One-time bootstrap | §9 Bootstrap & verification |
 
@@ -806,6 +806,50 @@ Pre-requisite (org owner, once): **LoomMud org → Settings → Personal access 
 
 Statuses show the token owner's GitHub account as the creator. That's expected. (A GitHub App or machine user can replace the PAT later; it's out of scope for Phase 1.)
 
+### 8.1b Fine-grained token for alerting (OBI-175/P2-O4)
+A second, separately-scoped token: `staging/alerts.sh` needs to read commit
+statuses (to check `staging/reconcile`) and to open/comment/close issues
+(to deliver an alert), but never needs to *write* a commit status -- least
+privilege keeps this out of `GITHUB_STATUS_TOKEN`, whose write access is
+scoped the other way around.
+
+1. Same org-owner pre-requisite as §8.1 (already done once that token
+   exists). As a board member: **GitHub → Settings → Developer settings →
+   Personal access tokens → Fine-grained tokens → Generate new token.**
+   - **Token name:** `loom-alerts`
+   - **Resource owner:** `LoomMud`
+   - **Expiration:** same policy as §8.1 -- put a calendar reminder two
+     weeks out. When it expires, `loom-alerts.timer` keeps running and
+     logging every check (see `staging/alerts.sh`), it just stops
+     delivering anything.
+   - **Repository access:** *Only select repositories* → `LoomMud/loom-gitops`
+   - **Permissions → Repository permissions:** **Commit statuses:
+     Read-only**, **Issues: Read and write**. Leave everything else as
+     *No access*. (*Metadata: Read-only* is added automatically.)
+   - No account permissions.
+2. Copy the token into the password manager. It goes into `secrets.env`
+   as `GITHUB_ALERTS_TOKEN` in §9.
+3. Verify (on any machine; not echoed or saved in history):
+   ```bash
+   read -rs GH_ALERTS_TOKEN; echo
+   # read check: commit statuses on a public repo don't even need auth,
+   # but confirm the token itself is valid and scoped right:
+   curl -fsS -H "Authorization: Bearer $GH_ALERTS_TOKEN" -H "Accept: application/vnd.github+json" \
+     https://api.github.com/repos/LoomMud/loom-gitops/commits/main/statuses | jq -r '.[0].state // "(no statuses yet)"'
+   # write check: opens + immediately closes a throwaway issue
+   NUM=$(curl -fsS -X POST \
+     -H "Authorization: Bearer $GH_ALERTS_TOKEN" -H "Accept: application/vnd.github+json" \
+     https://api.github.com/repos/LoomMud/loom-gitops/issues \
+     -d '{"title":"loom-alerts token check","body":"safe to close/delete","labels":["alert"]}' | jq -r '.number')
+   curl -fsS -X PATCH -H "Authorization: Bearer $GH_ALERTS_TOKEN" -H "Accept: application/vnd.github+json" \
+     https://api.github.com/repos/LoomMud/loom-gitops/issues/$NUM -d '{"state":"closed"}' >/dev/null
+   echo "opened and closed #$NUM"
+   unset GH_ALERTS_TOKEN
+   ```
+   On the token's page, check that the permissions list shows only
+   *Commit statuses: Read-only*, *Issues: Read and write* and
+   *Metadata: Read-only*.
+
 ### 8.2 GHCR: make `ghcr.io/loommud/loom` public
 > **Timing:** the package only exists after the first R5 release pushes an image (OBI-29). As of 2026-09-26 it doesn't exist yet (`Package not found`). Do this step as soon as the first image is published. Gandalf/Legolas will say when on OBI-56.
 
@@ -951,7 +995,7 @@ Nothing else. No keys, tokens, passwords or `secrets.env` contents.
 | # | Item | Guide's working assumption |
 |---|---|---|
 | R6-1 | `bootstrap.sh` invocation, run-as user, flags | `sudo /opt/loom-gitops/staging/bootstrap.sh` |
-| R6-2 | Exact `secrets.env` variable names | **Updated (OBI-130, supersedes OBI-106's single `POSTGRES_PASSWORD`):** `POSTGRES_SUPERUSER_PASSWORD`, `LOOM_OWNER_PASSWORD`, `LOOM_APP_PASSWORD`, `GITHUB_STATUS_TOKEN`, `AZURE_STORAGE_ACCOUNT`, `AZURE_STORAGE_CONTAINER`, `AZURE_STORAGE_SAS_TOKEN`, optional `GHCR_TOKEN` (see `staging/secrets.env.example`). If R6 needs a further rename, change the example file and the host file in the same PR/run. |
+| R6-2 | Exact `secrets.env` variable names | **Updated (OBI-130, supersedes OBI-106's single `POSTGRES_PASSWORD`; OBI-175 adds `GITHUB_ALERTS_TOKEN`):** `POSTGRES_SUPERUSER_PASSWORD`, `LOOM_OWNER_PASSWORD`, `LOOM_APP_PASSWORD`, `GITHUB_STATUS_TOKEN`, `GITHUB_ALERTS_TOKEN`, `AZURE_STORAGE_ACCOUNT`, `AZURE_STORAGE_CONTAINER`, `AZURE_STORAGE_SAS_TOKEN`, optional `GHCR_TOKEN` (see `staging/secrets.env.example`). If R6 needs a further rename, change the example file and the host file in the same PR/run. |
 | R6-3 | Reconciler unit user, paths and names | `User=loom`; `/etc/loom/secrets.env` `root:loom 0640`, dir `/etc/loom` `0750` (CTO decision, supersedes D-P1.13's "root 0600" and the earlier `loom-staging` names) |
 | R6-4 | Clone path | `/opt/loom-gitops`, owned by `loom` |
 | R6-5 | cosign: host package or container | host `cosign` installed from Ubuntu universe either way |

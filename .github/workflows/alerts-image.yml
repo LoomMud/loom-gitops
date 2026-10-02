@@ -1,0 +1,116 @@
+# SPDX-FileCopyrightText: 2026 Oberfield
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Builds and publishes the `alerts` one-shot's own image (OBI-175/P2-O4
+# follow-up, CTO review on PR #34 item 2): a tiny alpine:3.22 base
+# (same digest as BACKUP_IMAGE) with curl+jq already baked in, so
+# loom-alerts.timer's once-a-minute run never has to touch Alpine's
+# package repos (see staging/alerts/Dockerfile for the full rationale).
+#
+# Signed (cosign, keyless OIDC) and SBOM'd (syft), same supply-chain bar
+# as every other image this org ships. After a successful push, opens a
+# PR bumping ALERTS_IMAGE in staging/images.env to the new digest --
+# same pattern as bump-staging.yml, except the source here is this
+# repo's own build, not an upstream release.
+name: alerts-image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "staging/alerts/Dockerfile"
+      - ".github/workflows/alerts-image.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+  packages: write
+  id-token: write # cosign keyless signing
+
+jobs:
+  build:
+    runs-on: ${{ (vars.CI_RUNS_ON && startsWith(vars.CI_RUNS_ON, '[')) && fromJSON(vars.CI_RUNS_ON) || (vars.CI_RUNS_ON || 'ubuntu-latest') }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349 # v3.9.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf417 # v3.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@67a2d409c0a876cbe6b11854e3e25193efe4e62d # v6.12.0
+        with:
+          context: staging/alerts
+          file: staging/alerts/Dockerfile
+          push: true
+          tags: ghcr.io/loommud/loom-gitops-alerts:main
+          platforms: linux/amd64
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
+
+      - name: Sign image (keyless)
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: cosign sign --yes "ghcr.io/loommud/loom-gitops-alerts@${{ steps.push.outputs.digest }}"
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@7b36ad622f042cab6f59a75c2ac24ccb256e9b45 # v0.17.9
+        with:
+          image: ghcr.io/loommud/loom-gitops-alerts@${{ steps.push.outputs.digest }}
+          format: spdx-json
+          output-file: alerts-image.spdx.json
+          upload-artifact: true
+
+      - name: Attach SBOM to the image (cosign attest)
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          cosign attach sbom --sbom alerts-image.spdx.json "ghcr.io/loommud/loom-gitops-alerts@${{ steps.push.outputs.digest }}"
+
+      - name: Update images.env if changed
+        id: update
+        run: |
+          set -euo pipefail
+          new="ghcr.io/loommud/loom-gitops-alerts@${{ steps.push.outputs.digest }}"
+          current="$(grep '^ALERTS_IMAGE=' staging/images.env | cut -d= -f2- || true)"
+          if [ "$current" = "$new" ]; then
+            echo "ALERTS_IMAGE already up to date ($new); nothing to do"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          sed -i "s|^ALERTS_IMAGE=.*|ALERTS_IMAGE=${new}|" staging/images.env
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Open PR
+        if: steps.update.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@5e914681df9dc83aa4e4905692ca88beb2f9e91f # v7.0.5
+        with:
+          token: ${{ github.token }}
+          branch: bump-staging/alerts-image-${{ github.sha }}
+          delete-branch: true
+          author: "alerts-image[bot] <noreply@paperclip.ing>"
+          commit-message: |
+            staging: bump ALERTS_IMAGE to latest build
+
+            Signed-off-by: alerts-image[bot] <noreply@paperclip.ing>
+          title: "staging: bump ALERTS_IMAGE to latest build"
+          body: |
+            Automated bump (OBI-175/P2-O4 follow-up). New digest built,
+            signed (cosign) and SBOM'd by this workflow from
+            `staging/alerts/Dockerfile` at ${{ github.sha }}.
+
+            Digest: `${{ steps.push.outputs.digest }}`
+
+            **Merge = the next loom-alerts.timer run uses the new
+            image** (`docker compose --profile alerts run --rm alerts`
+            pulls by digest on its next invocation).
+          labels: staging-bump

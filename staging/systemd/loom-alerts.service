@@ -1,0 +1,17 @@
+# SPDX-FileCopyrightText: 2026 Oberfield
+# SPDX-License-Identifier: AGPL-3.0-only
+[Unit]
+Description=Loom staging alert checks (OBI-175/P2-O4: reconcile failure, /readyz, backup, error rate)
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User=loom
+Group=loom
+Environment=LOOM_GITOPS_DIR=/opt/loom-gitops
+Environment=LOOM_SECRETS_FILE=/etc/loom/secrets.env
+WorkingDirectory=/opt/loom-gitops/staging
+ExecStart=/usr/bin/docker compose --project-directory /opt/loom-gitops/staging --env-file /opt/loom-gitops/staging/images.env --env-file /etc/loom/secrets.env -f /opt/loom-gitops/staging/compose.yaml --profile alerts run --rm alerts
+TimeoutStartSec=120

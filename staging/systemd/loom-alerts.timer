@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: 2026 Oberfield
+# SPDX-License-Identifier: AGPL-3.0-only
+[Unit]
+Description=Run the Loom staging alert checks every minute (OBI-175/P2-O4; readyz threshold is 2 min, so this needs sub-2-min granularity)
+
+[Timer]
+OnBootSec=45s
+OnUnitActiveSec=1min
+AccuracySec=10s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

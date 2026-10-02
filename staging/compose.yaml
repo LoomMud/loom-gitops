@@ -213,9 +213,35 @@ services:
     volumes:
       - ./backup.sh:/scripts/backup.sh:ro
       - mudlib:/mudlib:ro
+      # OBI-175 (P2-O4): shared with the `alerts` service below so its
+      # backup-failure check can read what this run reported. A plain
+      # bind mount under staging/ (not a named volume), same pattern as
+      # the Caddyfile/backup.sh mounts above -- nothing in it needs to
+      # survive `compose down -v`.
+      - ./alerts-state:/alerts-state
     depends_on:
       postgres:
         condition: service_healthy
+
+  # One-shot alert check (OBI-175/P2-O4): reconcile/deploy failure,
+  # /readyz down > 2 min, backup failure, and runtime-error rate (once
+  # OBI-169/P2-B4 lands). Run every minute by loom-alerts.timer
+  # (`docker compose --profile alerts run --rm alerts`). On the default
+  # compose network so it can reach `loom:8080` directly, the same
+  # reason `migrate`/`backup` don't need LOOM_HTTP_ADDR published to the
+  # host. See staging/alerts.sh for what each check does and where
+  # alerts are delivered (a GitHub issue, labeled "alert", in this repo
+  # -- the channel this team already watches, not a new chat tool).
+  alerts:
+    image: ${ALERTS_IMAGE}
+    profiles: ["alerts"]
+    restart: "no"
+    entrypoint: ["/bin/sh", "/scripts/alerts.sh"]
+    environment:
+      GITHUB_ALERTS_TOKEN: ${GITHUB_ALERTS_TOKEN:-}
+    volumes:
+      - ./alerts.sh:/scripts/alerts.sh:ro
+      - ./alerts-state:/alerts-state
 
   # Optional observability profile: `docker compose --profile obs up -d`.
   prometheus:

@@ -1,0 +1,8 @@
+# SPDX-FileCopyrightText: 2026 Oberfield
+# SPDX-License-Identifier: AGPL-3.0-only
+
+# OBI-175 (P2-O4): runtime alert state (open-issue markers, backup
+# status, debounce timestamps), bind-mounted into the `backup` and
+# `alerts` compose services. Host-local runtime data, not repo content.
+/staging/alerts-state/*
+!/staging/alerts-state/.gitkeep
