@@ -100,10 +100,18 @@ tar -C /mudlib -cf "$WORKDIR/mudlib-${stamp}.tar" .
 log "archiving saves"
 tar -C /saves -cf "$WORKDIR/saves-${stamp}.tar" .
 
+log "archiving mudlib-git"
+# OBI-192/B3.5 (D-B3.6): the driver's Git history, a second copy of
+# `live/<env>` on GitHub but also the fastest way to rebuild a host
+# without a network dependency -- restore it with `tar -C /mudlib-git -xf
+# mudlib-git-<stamp>.tar` after decrypting, same as the mudlib tarball.
+tar -C /mudlib-git -cf "$WORKDIR/mudlib-git-${stamp}.tar" .
+
 log "age-encrypting"
 age -r "$BACKUP_AGE_RECIPIENT" -o "$WORKDIR/loom-${stamp}.dump.age" "$WORKDIR/loom-${stamp}.dump"
 age -r "$BACKUP_AGE_RECIPIENT" -o "$WORKDIR/mudlib-${stamp}.tar.age" "$WORKDIR/mudlib-${stamp}.tar"
 age -r "$BACKUP_AGE_RECIPIENT" -o "$WORKDIR/saves-${stamp}.tar.age" "$WORKDIR/saves-${stamp}.tar"
+age -r "$BACKUP_AGE_RECIPIENT" -o "$WORKDIR/mudlib-git-${stamp}.tar.age" "$WORKDIR/mudlib-git-${stamp}.tar"
 
 # rclone azureblob backend via an inline remote config (SETUP.md Appendix
 # A, R6-12): sas_url, no_check_container (the SAS can't create/inspect
@@ -128,6 +136,8 @@ rclone copy \
   "$WORKDIR/mudlib-${stamp}.tar.age" "loombackup:${AZURE_STORAGE_CONTAINER}/${prefix}/" 2>&1 | sed 's/^/  /'
 rclone copy \
   "$WORKDIR/saves-${stamp}.tar.age" "loombackup:${AZURE_STORAGE_CONTAINER}/${prefix}/" 2>&1 | sed 's/^/  /'
+rclone copy \
+  "$WORKDIR/mudlib-git-${stamp}.tar.age" "loombackup:${AZURE_STORAGE_CONTAINER}/${prefix}/" 2>&1 | sed 's/^/  /'
 
-log "done: ${prefix}/loom-${stamp}.dump.age, ${prefix}/mudlib-${stamp}.tar.age, ${prefix}/saves-${stamp}.tar.age"
+log "done: ${prefix}/loom-${stamp}.dump.age, ${prefix}/mudlib-${stamp}.tar.age, ${prefix}/saves-${stamp}.tar.age, ${prefix}/mudlib-git-${stamp}.tar.age"
 STATUS=success

@@ -32,6 +32,11 @@ doesn't deliver anything). Leave the `AZURE_STORAGE_*` and
 documented no-op, not a failure.
 
 Never `cat` this file to a shared screen or paste its contents anywhere.
+
+**B3/OBI-192 adds two file-based secrets, not `secrets.env` lines**
+(D-B3.11/D-B3.12): the `loom-warp-propose` GitHub App private key and the
+webhook HMAC secret. See §12 below -- they're a separate step because
+they're real files at `staging/secrets/`, not `NAME=value` lines.
 `secrets.env.example` in this repo holds names only.
 
 ## 2. Install the timer (and run the first reconcile)
@@ -389,3 +394,82 @@ instead of calling the GitHub API -- useful for checking the detection
 logic (readyz timer math, backup status parsing) without a token or a
 real repo. See `.github/workflows/ci.yml`'s `alerts-dry-run` job for a
 worked example against a throwaway HTTP stub instead of a real `loom`.
+## 12. Git-backed mudlib: seed, secrets, and WARP_REF after B3 (OBI-192/P2-B3.5)
+
+**Design reference:** OBI-181 design (Paperclip, §6/D-B3.1-D-B3.14). Parent work: OBI-165 §8.3 P2-B3.
+
+### What changed
+
+Before B3 (D-P1.11): `mudlib-sync` cloned `WARP_REPO` at `WARP_REF` into
+the `mudlib` volume, stripped `.git`, and mounted it `:ro` in `loom`. A
+`WARP_REF` bump in `images.env` reset the volume and recreated `loom`
+(the `org.loommud.warp-ref` label).
+
+**After B3 (D-B3.6), the driver owns a writable Git working tree:**
+`GIT_DIR=/mudlib-git/warp.git` (a separate named volume), work tree
+`/mudlib` (now mounted read-write) -- nothing named `.git` ever exists
+under `/mudlib` (D-B3.2). `mudlib-sync` is **seed-only**: it runs exactly
+once per volume pair. If `/mudlib-git/warp.git/HEAD` already exists it
+exits 0 and touches nothing at all. Otherwise it clones `WARP_REPO`,
+creates the `live` branch at `WARP_REF`, checks it out into `/mudlib`,
+and `chown`s both volumes to the `loom` uid (`LOOM_UID` in
+`images.env`, matching the Dockerfile's `useradd --uid 10001`) -- the
+seed step runs as root (the upstream `alpine/git` image sets no `USER`),
+but `loom` itself never does.
+
+**`WARP_REF` is bootstrap-only once a tree exists.** After the first
+seed, the driver's own `loom-git` worker (`GitWorker`: auto-commit on
+every builder save, async push to `live/<env>`, sync off GitHub's `main`
+by webhook kick + 5-minute poll -- OBI-190) is the thing that moves
+`live` forward, not a GitOps pin. Editing `WARP_REF` in `images.env`
+after go-live does not reset or re-seed anything; it is inert until the
+volume is deleted and seeded fresh (a deliberate rebuild, not a routine
+reconcile). The `org.loommud.warp-ref` label on the `loom` service still
+recreates the container when `WARP_REF` changes (harmless, and only
+matters pre-seed) -- see the comment in `compose.yaml` if that ever
+needs revisiting.
+
+### Fill in the two B3 secrets (D-B3.11/D-B3.12)
+
+```bash
+sudo install -d -o loom -g loom -m 0750 /opt/loom-gitops/staging/secrets
+sudo install -o loom -g loom -m 0400 /dev/null /opt/loom-gitops/staging/secrets/warp_app.pem
+sudo install -o loom -g loom -m 0400 /dev/null /opt/loom-gitops/staging/secrets/warp_webhook
+sudoedit /opt/loom-gitops/staging/secrets/warp_app.pem      # the loom-warp-propose GitHub App's private key (PEM)
+sudoedit /opt/loom-gitops/staging/secrets/warp_webhook      # `openssl rand -hex 32`; also set as the App's webhook secret
+sudo stat -c '%U:%G %a' /opt/loom-gitops/staging/secrets/warp_app.pem /opt/loom-gitops/staging/secrets/warp_webhook   # expect: loom:loom 400
+```
+
+**Both are placeholders until Q-P2.3 is answered** (board decision: a new
+`loom-warp-propose` App, install the reviewer App on `warp` too, raise
+`main` to 1 required approval -- see the design doc §9). Until then,
+leave the `*.example` files uninstalled (or install them verbatim) --
+`loom-git` treats a missing/placeholder App config the same as "no App
+configured": push and `propose` are disabled, logged once at boot, and
+everything else (auto-commit to `live`, local history) still works.
+Also fill in `LOOM_GIT_APP_ID`/`LOOM_GIT_INSTALLATION_ID` (and
+`LOOM_GIT_REPO` if it's ever not `LoomMud/warp`) in `secrets.env` once
+the App exists; `compose.yaml` passes them through as
+`LOOM_GIT_APP_ID`/`LOOM_GIT_INSTALLATION_ID`/`LOOM_GIT_REPO` with empty
+defaults.
+
+Never commit the real files -- only `staging/secrets/*.example` is
+tracked; `.gitignore` excludes the real ones.
+
+### The GitHub webhook route
+
+Caddy forwards `POST /api/v1/hooks/github` to `loom:8080` (D-B3.12); the
+real validation (HMAC against `warp_webhook`, delivery dedupe, 1 MiB
+body cap, 30/min rate limit) is `loom-http`'s job, not Caddy's. Point the
+App's webhook URL at `https://loommud.com/api/v1/hooks/github` once it
+exists (Q-P2.3).
+
+### Backups now include `mudlib-git`
+
+`staging/backup.sh` archives `/mudlib-git` alongside `/mudlib` and the
+Postgres dump (same age-encryption, same `rclone` upload). It is a
+second copy of the driver's Git history, independent of `live/<env>` on
+GitHub -- useful for a host rebuild with no GitHub dependency. `restore.sh`
+is unchanged (OBI-164's drill restores Postgres + confirms the mudlib
+tarball; restoring `mudlib-git` by hand is `tar -C /mudlib-git -xf
+mudlib-git-<stamp>.tar` after decrypting, same as the mudlib tarball).

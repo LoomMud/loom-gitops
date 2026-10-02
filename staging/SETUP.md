@@ -908,6 +908,8 @@ The **age public key is not a secret** and doesn't go here. R6 keeps it in repo 
 
 Don't `cat` the file on a shared screen, and don't paste its contents anywhere.
 
+**B3/OBI-192 adds two more secrets, but not here:** the `loom-warp-propose` GitHub App private key and the webhook HMAC secret are files, not `secrets.env` lines (D-B3.11/D-B3.12) -- see `RUNBOOK.md` §12 for the exact install commands and modes once Q-P2.3 provisions the real App. Until then the placeholders in `staging/secrets/*.example` are enough to boot: `loom-git` runs with push/`propose` disabled and logs that once at boot.
+
 ### 9.3 Run the bootstrap
 ```bash
 sudo /opt/loom-gitops/staging/bootstrap.sh
