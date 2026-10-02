@@ -51,29 +51,46 @@ COMMENT_THROTTLE_SECS="${LOOM_ALERTS_COMMENT_THROTTLE_SECS:-900}"
 DRY_RUN="${LOOM_ALERTS_DRY_RUN:-0}"
 GH_TOKEN="${GITHUB_ALERTS_TOKEN:-}"
 
-# The BACKUP_IMAGE base (staging/images.env) is plain Alpine, same as
-# backup.sh: install the two tools this script needs from Alpine's own
-# repos. Idempotent; network access required (same outbound path the
-# `backup` and `mudlib-sync` services already use). Guarded by `apk`
-# existing at all, so this script also runs unmodified on a plain Linux
-# box (CI's dry-run job, or a developer's workstation) that already has
-# curl/jq from its own package manager.
-if command -v apk >/dev/null 2>&1; then
-  apk add --no-cache curl jq >/dev/null
+# ALERTS_IMAGE (staging/images.env) already bakes curl+jq in (OBI-175/P2-O4
+# follow-up, CTO review on PR #34 item 2) -- unlike backup.sh's once-a-night
+# apk add, this runs every minute, so a per-pass Alpine CDN/DNS blip must
+# never be able to silence all four checks under `set -e`. Only fall back
+# to installing them here (best-effort, never fatal) for a plain Linux box
+# that doesn't carry them yet: a developer workstation, CI's dry-run job,
+# or ALERTS_IMAGE before its first bump. A failed install here degrades
+# gracefully (checks that don't need curl/jq, i.e. backup, still run;
+# reconcile/readyz/error_rate log a one-line skip instead of aborting the
+# whole pass) rather than exiting nonzero.
+HAVE_CURL=0; HAVE_JQ=0
+command -v curl >/dev/null 2>&1 && HAVE_CURL=1
+command -v jq >/dev/null 2>&1 && HAVE_JQ=1
+if [ "$HAVE_CURL" -eq 0 ] || [ "$HAVE_JQ" -eq 0 ]; then
+  if command -v apk >/dev/null 2>&1; then
+    if apk add --no-cache curl jq >/dev/null 2>&1; then
+      HAVE_CURL=1; HAVE_JQ=1
+    else
+      echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') alerts: WARNING: apk add curl jq failed (network blip?); this pass will skip whatever checks need them" >&2
+    fi
+  fi
 fi
-for cmd in curl jq; do
-  command -v "$cmd" >/dev/null 2>&1 || { echo "FATAL: missing required command: $cmd" >&2; exit 1; }
-done
 
 mkdir -p "$STATE_DIR"
 
 log() { printf '%s alerts: %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"; }
 
 gh_get() {
-  # gh_get <url> -- unauthenticated is fine for public-repo reads
-  # (commit + statuses); keeps the one token we do carry scoped to
-  # Issues only (least privilege).
-  curl -fsS -H "Accept: application/vnd.github+json" "$@"
+  # gh_get <url> -- authenticated with GITHUB_ALERTS_TOKEN (Commit
+  # statuses: Read-only; SETUP.md §8.1b). Unauthenticated reads are rate
+  # limited to 60/h per IP; at 1 pass/min, check_reconcile's 2 calls alone
+  # are 120/h, which starts silently skipping checks after ~30 min (CTO
+  # review on PR #34 item 1). Authenticated gets 5000/h, which this never
+  # gets close to. Falls back to unauthenticated only if GITHUB_ALERTS_TOKEN
+  # isn't set yet (still works, just rate-limited the same old way).
+  if [ -n "$GH_TOKEN" ]; then
+    curl -fsS -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" "$@"
+  else
+    curl -fsS -H "Accept: application/vnd.github+json" "$@"
+  fi
 }
 
 gh_api() {
@@ -149,17 +166,25 @@ notify_resolve() {
 }
 
 check_reconcile() {
-  sha="$RECONCILE_SHA"
-  if [ -z "$sha" ]; then
-    sha="$(gh_get "https://api.github.com/repos/${RECONCILE_REPO}/commits/main" 2>/dev/null | jq -r '.sha // empty')"
-  fi
-  if [ -z "$sha" ]; then
-    log "WARNING: could not resolve origin/main sha for ${RECONCILE_REPO}; skipping reconcile check"
+  if [ "$HAVE_CURL" -eq 0 ] || [ "$HAVE_JQ" -eq 0 ]; then
+    log "reconcile check: curl/jq unavailable this pass; skipping"
     return 0
   fi
-  statuses="$(gh_get "https://api.github.com/repos/${RECONCILE_REPO}/commits/${sha}/statuses" 2>/dev/null || echo '[]')"
-  state="$(printf '%s' "$statuses" | jq -r '[.[] | select(.context=="staging/reconcile")][0].state // "unknown"')"
-  desc="$(printf '%s' "$statuses" | jq -r '[.[] | select(.context=="staging/reconcile")][0].description // ""')"
+  # Combined-status endpoint (CTO review on PR #34 item 1): one GitHub
+  # call instead of two (resolve main's sha, then list its statuses) --
+  # it accepts a branch name directly as the ref and returns both the
+  # resolved sha and every context's status together. Authenticated via
+  # gh_get (GITHUB_ALERTS_TOKEN, Commit statuses: Read-only) to stay well
+  # under the rate limit even on the override path below.
+  ref="${RECONCILE_SHA:-main}"
+  combined="$(gh_get "https://api.github.com/repos/${RECONCILE_REPO}/commits/${ref}/status" 2>/dev/null || echo '{}')"
+  sha="$(printf '%s' "$combined" | jq -r '.sha // empty')"
+  if [ -z "$sha" ]; then
+    log "WARNING: could not resolve combined status for ${RECONCILE_REPO}@${ref}; skipping reconcile check"
+    return 0
+  fi
+  state="$(printf '%s' "$combined" | jq -r '[.statuses[] | select(.context=="staging/reconcile")][0].state // "unknown"')"
+  desc="$(printf '%s' "$combined" | jq -r '[.statuses[] | select(.context=="staging/reconcile")][0].description // ""')"
   case "$state" in
     failure|error)
       notify_fire reconcile "[ALERT] staging/reconcile is failing" \
@@ -176,6 +201,10 @@ check_reconcile() {
 
 check_readyz() {
   marker="$STATE_DIR/readyz-down-since"
+  if [ "$HAVE_CURL" -eq 0 ]; then
+    log "readyz check: curl unavailable this pass; skipping"
+    return 0
+  fi
   code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "${LOOM_HTTP_BASE}/readyz" 2>/dev/null)" || true
   [ -n "$code" ] || code=000
   if [ "$code" = "200" ]; then
@@ -206,6 +235,21 @@ check_backup() {
   fi
   status="$(awk '{print $1}' "$BACKUP_STATUS_FILE")"
   ts="$(awk '{print $2}' "$BACKUP_STATUS_FILE")"
+  # Staleness (CTO review on PR #34 item 3): backup.sh runs nightly, so a
+  # good status should never be more than ~24h old. A dead loom-backup.timer
+  # or a SIGKILLed backup.sh (no EXIT trap chance to write anything) leaves
+  # the file's last status as 'success' forever -- without this, that reads
+  # as healthy indefinitely. 26h (not 24h) gives slack for a run that
+  # starts a bit late or runs long, same margin as the OBI-164 restore
+  # drill's timing comments. file mtime, not the timestamp field, in case
+  # clocks ever drift between the write and this check.
+  age="$(( $(date +%s) - $(stat -c %Y "$BACKUP_STATUS_FILE" 2>/dev/null || stat -f %m "$BACKUP_STATUS_FILE") ))"
+  stale_threshold=$((26 * 3600))
+  if [ "$age" -ge "$stale_threshold" ]; then
+    notify_fire backup "[ALERT] staging backup status is stale (${age}s old)" \
+      "backup-status last written at ${ts} (file age ${age}s, >= ${stale_threshold}s threshold) reports '${status}'. Either loom-backup.timer stopped firing or the last backup.sh run never reached its EXIT trap (e.g. SIGKILLed). See journalctl -u loom-backup.timer and journalctl -u loom-backup.service on the host."
+    return 0
+  fi
   case "$status" in
     failure)
       notify_fire backup "[ALERT] staging backup job failed" \
@@ -221,13 +265,28 @@ check_backup() {
 }
 
 check_error_rate() {
+  if [ "$HAVE_CURL" -eq 0 ] || [ "$HAVE_JQ" -eq 0 ]; then
+    log "error-rate check: curl/jq unavailable this pass; skipping"
+    return 0
+  fi
   metrics="$(curl -s --max-time 5 "${LOOM_HTTP_BASE}/metrics" 2>/dev/null || true)"
-  line="$(printf '%s\n' "$metrics" | grep "^${ERROR_METRIC}" | head -1 || true)"
-  if [ -z "$line" ]; then
+  # TODO(OBI-169/P2-B4): once the real counter lands, confirm whether it's
+  # single-series or carries labels. For now this: (a) excludes Prometheus
+  # client libraries' auto-generated "<metric>_created" gauge, which starts
+  # with the same name prefix and would otherwise be matched and misread as
+  # a second/foreign sample of the counter itself (CTO review on PR #34
+  # item 4); (b) if the real metric is labelled (multiple series, e.g. per
+  # error kind), sums every matching series into one combined counter
+  # rather than reading only the first -- a reasonable default for a
+  # single alert threshold, revisit once OBI-169 defines the real SLO.
+  value="$(printf '%s\n' "$metrics" | awk -v m="$ERROR_METRIC" '
+    $1 == m || ($1 ~ "^" m "\\{") { sum += $2; found = 1 }
+    END { if (found) printf "%.6f", sum }
+  ')"
+  if [ -z "$value" ]; then
     log "metric '${ERROR_METRIC}' not present yet (OBI-169/P2-B4 not landed); skipping error-rate check"
     return 0
   fi
-  value="$(printf '%s' "$line" | awk '{print $2}')"
   prev_file="$STATE_DIR/error-rate-prev"
   now="$(date +%s)"
   if [ ! -f "$prev_file" ]; then

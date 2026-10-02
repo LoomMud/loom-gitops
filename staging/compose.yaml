@@ -233,7 +233,7 @@ services:
   # alerts are delivered (a GitHub issue, labeled "alert", in this repo
   # -- the channel this team already watches, not a new chat tool).
   alerts:
-    image: ${BACKUP_IMAGE}
+    image: ${ALERTS_IMAGE}
     profiles: ["alerts"]
     restart: "no"
     entrypoint: ["/bin/sh", "/scripts/alerts.sh"]

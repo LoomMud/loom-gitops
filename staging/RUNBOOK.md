@@ -276,6 +276,16 @@ Four checks, each independent:
 | `backup` | `backup.sh`'s last run wrote `failure` to `./alerts-state/backup-status` | shared bind mount between the `backup` and `alerts` services |
 | `error_rate` | the counter `loom_runtime_errors_total` (`LOOM_ALERTS_ERROR_METRIC`) increases faster than `LOOM_ALERTS_ERROR_RATE_THRESHOLD` (default 1/s, a placeholder) | `loom`'s `/metrics` |
 
+**These are all on-host checks and cannot see a host outage** (the host
+itself down, Docker dead, or the compose network unreachable): all four
+run as `docker compose --profile alerts run --rm alerts` on the same
+host they're checking, so if the host is down, nothing runs `alerts.sh`
+at all and no alert fires for that. An off-host probe (pinging the host
+from somewhere else entirely) is filed separately as
+[OBI-196](https://github.com/LoomMud/loom-gitops/issues/196), not yet
+built. Until then, a total host outage is this alerting system's blind
+spot.
+
 **`error_rate` is wired but inert until OBI-169 (P2-B4, the error inbox)
 lands and exports that counter.** Until then, `alerts.sh` logs a skip
 every run ("metric not present yet") and never fires. Once OBI-169 ships,

@@ -261,3 +261,48 @@ jobs:
             LOOM_ALERTS_LOOM_HTTP_BASE=http://127.0.0.1:18998 \
             sh staging/alerts.sh 2>&1 | tee /tmp/alerts-ci2.log
           grep -q "not present yet (OBI-169/P2-B4 not landed)" /tmp/alerts-ci2.log
+      - name: error-rate check -- ignores the Prometheus client's auto _created series (CTO review item 4)
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/alerts-ci3; mkdir -p /tmp/alerts-ci3
+          python3 - <<'PY' &
+          import http.server
+          class H(http.server.BaseHTTPRequestHandler):
+              def do_GET(self):
+                  if self.path == "/readyz":
+                      self.send_response(200); self.end_headers(); self.wfile.write(b"ok")
+                  elif self.path == "/metrics":
+                      self.send_response(200); self.end_headers()
+                      # _created carries a huge, unrelated epoch-seconds value
+                      # (as the Prometheus client libs emit); a naive
+                      # `grep "^metric"` match would misread this as the
+                      # counter itself and report a bogus rate.
+                      self.wfile.write(b"loom_runtime_errors_total_created 1700000000\nloom_runtime_errors_total 10\n")
+                  else:
+                      self.send_response(404); self.end_headers()
+              def log_message(self, *a): pass
+          http.server.HTTPServer(("127.0.0.1", 18997), H).serve_forever()
+          PY
+          sleep 1
+          echo "$(( $(date +%s) - 5 )) 5" > /tmp/alerts-ci3/error-rate-prev
+          LOOM_ALERTS_DRY_RUN=1 LOOM_ALERTS_STATE_DIR=/tmp/alerts-ci3 \
+            LOOM_ALERTS_LOOM_HTTP_BASE=http://127.0.0.1:18997 \
+            LOOM_ALERTS_ERROR_RATE_THRESHOLD=0.5 \
+            sh staging/alerts.sh 2>&1 | tee /tmp/alerts-ci3.log
+          # 10 - 5 over 5s = 1/s, over the 0.5/s threshold -- fires. If
+          # _created's huge value leaked into the sum this would be wildly
+          # higher and still "fire", so also assert the log shows the
+          # correct small delta/rate, not a value in the billions.
+          grep -q "\[dry-run\] would fire 'error_rate'" /tmp/alerts-ci3.log
+          grep -q "rate is 1.0000/s" /tmp/alerts-ci3.log
+      - name: backup check -- stale status fires even though it still says success (CTO review item 3)
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/alerts-ci4; mkdir -p /tmp/alerts-ci4
+          echo "success $(date -u '+%Y-%m-%dT%H:%M:%SZ')" > /tmp/alerts-ci4/backup-status
+          touch -d '27 hours ago' /tmp/alerts-ci4/backup-status
+          LOOM_ALERTS_DRY_RUN=1 LOOM_ALERTS_STATE_DIR=/tmp/alerts-ci4 \
+            LOOM_ALERTS_LOOM_HTTP_BASE=http://127.0.0.1:18999 \
+            sh staging/alerts.sh 2>&1 | tee /tmp/alerts-ci4.log
+          grep -q "\[dry-run\] would fire 'backup'" /tmp/alerts-ci4.log
+          grep -q "status is stale" /tmp/alerts-ci4.log
