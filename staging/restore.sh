@@ -173,6 +173,9 @@ if [ -n "$in_use" ]; then
   exit 1
 fi
 log "restoring saves tarball into docker volume '${SAVES_VOLUME}'"
+if [ "$SAVES_VOLUME_IS_SCRATCH" = "0" ] && ! docker volume inspect "$SAVES_VOLUME" >/dev/null 2>&1; then
+  log "WARNING: docker volume '${SAVES_VOLUME}' does not exist yet -- creating it fresh. If this was meant to be an existing volume (e.g. the real 'loom_saves'), check for a typo in --saves-volume before continuing: this will restore into a brand-new empty volume instead."
+fi
 docker volume create "$SAVES_VOLUME" >/dev/null
 # Best-effort safety net, not a substitute for a real backup: if the
 # target volume already has anything in it, snapshot it next to $PWD
@@ -180,11 +183,32 @@ docker volume create "$SAVES_VOLUME" >/dev/null
 # the point) before overwriting, so an operator who restores the wrong
 # date can recover what was there a moment ago instead of losing it
 # outright.
-if [ "$(docker run --rm -v "${SAVES_VOLUME}:/saves:ro" alpine:3.20 find /saves -mindepth 1 -print -quit)" != "" ]; then
+# `docker run ... find` can itself fail (daemon hiccup, image pull
+# failure, etc.) -- capture its exit status explicitly rather than
+# relying on `set -e` inside a `[ "$(...)" != "" ]` test, which would
+# silently treat a failed probe the same as "empty volume" and skip the
+# snapshot below.
+if ! probe_out="$(docker run --rm -v "${SAVES_VOLUME}:/saves:ro" alpine:3.20 find /saves -mindepth 1 -print -quit)"; then
+  echo "failed to probe '${SAVES_VOLUME}' for existing contents -- refusing to guess whether a pre-restore snapshot is needed" >&2
+  exit 1
+fi
+if [ -n "$probe_out" ]; then
   pre_restore_tar="./saves-pre-restore-$(date -u '+%Y%m%dT%H%M%SZ').tar"
   log "snapshotting existing contents of '${SAVES_VOLUME}' to ${pre_restore_tar} before overwriting"
-  docker run --rm -v "${SAVES_VOLUME}:/saves:ro" -v "$PWD:/backup" \
-    alpine:3.20 tar -C /saves -cf "/backup/${pre_restore_tar#./}" .
+  # Saves files may hold credential material (password hashes), so the
+  # snapshot must never be world-readable. Stream the tar out of the
+  # container and create the file host-side under umask 077: it is 0600
+  # from creation (no 0644 window) and owned by the invoking operator.
+  # Writing it from root inside the container and chmod-ing afterwards
+  # would fail with EPERM for a non-root operator (RUNBOOK runs this
+  # script without sudo) and abort the restore under `set -e`. See
+  # RUNBOOK.md §5/§6 for moving it somewhere safe (or shredding it) once
+  # the restore is confirmed good.
+  (
+    umask 077
+    docker run --rm -v "${SAVES_VOLUME}:/saves:ro" \
+      alpine:3.20 tar -C /saves -cf - . >"$pre_restore_tar"
+  )
 fi
 docker run --rm \
   -v "${SAVES_VOLUME}:/saves" \

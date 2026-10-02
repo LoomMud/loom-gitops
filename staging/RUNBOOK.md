@@ -155,7 +155,14 @@ Blob backups are configured and have at least one nightly run:
    This overwrites files already in `loom_saves` with the ones from the
    tarball (tar doesn't delete anything *not* in the tarball); it chowns
    the whole volume back to 10001:10001 afterwards, the same as
-   `saves-init`.
+   `saves-init`. If `loom_saves` already had anything in it,
+   `restore.sh` snapshots it first to `./saves-pre-restore-<timestamp>.tar`
+   (0600, next to `$PWD`, never inside its `$WORKDIR`, which is shredded on
+   exit) -- treat that tarball with the same care as the age private key:
+   once you've confirmed the restore above is good, move it somewhere safe
+   (off the host, encrypted) or `shred -u` it. Don't leave it sitting
+   world-reachable on the host; loom save files (`.o`) may hold credential
+   material.
 
 ## 6. Restore drill
 
@@ -173,7 +180,12 @@ touches anything persistent. Pass `--saves-volume <name>` to target a
 real one instead (the real deploy's is `loom_saves`, per §5 step 6
 above);
 an explicitly-named volume is never deleted by this script, and it
-refuses to restore into one a running container still has mounted.
+refuses to restore into one a running container still has mounted. If
+that explicitly-named volume didn't already exist, the script warns and
+creates it fresh -- check for a typo before trusting a successful run. If
+it already had contents, the script snapshots them to
+`./saves-pre-restore-<timestamp>.tar` (0600) first; see §5 step 6 for
+what to do with that file afterwards.
 
 This fetches the three blobs for that date (postgres dump, mudlib
 tarball, saves tarball), decrypts them with the age
