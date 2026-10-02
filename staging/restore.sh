@@ -195,14 +195,20 @@ fi
 if [ -n "$probe_out" ]; then
   pre_restore_tar="./saves-pre-restore-$(date -u '+%Y%m%dT%H%M%SZ').tar"
   log "snapshotting existing contents of '${SAVES_VOLUME}' to ${pre_restore_tar} before overwriting"
-  docker run --rm -v "${SAVES_VOLUME}:/saves:ro" -v "$PWD:/backup" \
-    alpine:3.20 tar -C /saves -cf "/backup/${pre_restore_tar#./}" .
-  # Root inside the helper container writes this with the default umask
-  # (world-readable, 0644) -- saves files may hold credential material
-  # (password hashes), so lock it down immediately. See RUNBOOK.md §5/§6
-  # for moving it somewhere safe (or shredding it) once the restore is
-  # confirmed good.
-  chmod 0600 "$pre_restore_tar"
+  # Saves files may hold credential material (password hashes), so the
+  # snapshot must never be world-readable. Stream the tar out of the
+  # container and create the file host-side under umask 077: it is 0600
+  # from creation (no 0644 window) and owned by the invoking operator.
+  # Writing it from root inside the container and chmod-ing afterwards
+  # would fail with EPERM for a non-root operator (RUNBOOK runs this
+  # script without sudo) and abort the restore under `set -e`. See
+  # RUNBOOK.md §5/§6 for moving it somewhere safe (or shredding it) once
+  # the restore is confirmed good.
+  (
+    umask 077
+    docker run --rm -v "${SAVES_VOLUME}:/saves:ro" \
+      alpine:3.20 tar -C /saves -cf - . >"$pre_restore_tar"
+  )
 fi
 docker run --rm \
   -v "${SAVES_VOLUME}:/saves" \
