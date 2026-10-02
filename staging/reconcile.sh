@@ -141,6 +141,19 @@ if [ "$mudlib_sync_exit" != "0" ]; then
   fail "mudlib-sync exited $mudlib_sync_exit"
 fi
 
+# One-shot saves-init (OBI-172/OBI-240): judged by exit code the same way
+# as mudlib-sync, so a chown/chmod failure on the saves volume is
+# attributed clearly in the reconcile log instead of surfacing later as a
+# mysterious loom write failure.
+saves_init_cid="$(compose ps -a -q saves-init || true)"
+if [ -z "$saves_init_cid" ]; then
+  fail "saves-init container not found"
+fi
+saves_init_exit="$(docker inspect --format '{{.State.ExitCode}}' "$saves_init_cid")"
+if [ "$saves_init_exit" != "0" ]; then
+  fail "saves-init exited $saves_init_exit"
+fi
+
 # 5. Post a GitHub commit status on the reconciled loom-gitops SHA.
 if [ "$sha_before" = "$sha_after" ]; then
   post_status "success" "no-op reconcile at $sha_after"

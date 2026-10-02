@@ -242,6 +242,9 @@ services:
     volumes:
       - ./backup.sh:/scripts/backup.sh:ro
       - mudlib:/mudlib:ro
+      # Character saves (OBI-172/OBI-241): read-only, same reasoning as
+      # the mudlib mount above -- backup.sh only ever reads this volume.
+      - saves:/saves:ro
       # OBI-175 (P2-O4): shared with the `alerts` service below so its
       # backup-failure check can read what this run reported. A plain
       # bind mount under staging/ (not a named volume), same pattern as
@@ -306,8 +309,8 @@ volumes:
   pgdata:
   mudlib:
   # Character saves (OBI-172). Survives container recreation and WARP_REF
-  # bumps; only `compose down -v` removes it. Not in the nightly backup
-  # yet (follow-up tracked on the OBI-172 thread).
+  # bumps; only `compose down -v` removes it. Covered by the nightly
+  # backup and the restore drill (OBI-241), the same as mudlib/postgres.
   saves:
   caddy-data:
   caddy-config:

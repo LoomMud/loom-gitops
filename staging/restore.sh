@@ -13,7 +13,15 @@
 # the real `postgres` service) and runs a smoke query.
 #
 # Usage:
-#   staging/restore.sh --age-key <path-to-private-key> --prefix daily --date YYYY-MM-DD
+#   staging/restore.sh --age-key <path-to-private-key> --prefix daily --date YYYY-MM-DD [--saves-volume <name>]
+#
+# --saves-volume (OBI-172/OBI-241, default: saves) names the docker
+# volume the saves tarball is restored into -- the real deploy always
+# targets the actual named volume `compose.yaml`'s `loom` service mounts
+# at /saves, project-prefixed by compose to `loom_saves` (compose.yaml's
+# top-level `name: loom`), while the CI restore drill passes a disposable
+# name so it never touches a real `saves` volume that might exist on the
+# runner.
 #
 # Requires the same AZURE_STORAGE_ACCOUNT / AZURE_STORAGE_CONTAINER /
 # AZURE_STORAGE_SAS_TOKEN as backup.sh, read from the environment (source
@@ -23,16 +31,18 @@
 set -eu
 
 log() { printf '%s restore: %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"; }
-usage() { echo "usage: $0 --age-key <path> --prefix <daily|weekly> --date <YYYY-MM-DD>" >&2; exit 1; }
+usage() { echo "usage: $0 --age-key <path> --prefix <daily|weekly> --date <YYYY-MM-DD> [--saves-volume <name>]" >&2; exit 1; }
 
 AGE_KEY=""
 PREFIX=""
 DATE=""
+SAVES_VOLUME="saves"
 while [ $# -gt 0 ]; do
   case "$1" in
     --age-key) AGE_KEY="$2"; shift 2 ;;
     --prefix) PREFIX="$2"; shift 2 ;;
     --date) DATE="$2"; shift 2 ;;
+    --saves-volume) SAVES_VOLUME="$2"; shift 2 ;;
     *) usage ;;
   esac
 done
@@ -72,16 +82,20 @@ log "listing ${PREFIX}/ for ${DATE}"
 # provided in command ... do not match").
 dump_blob="$(rclone lsf "loombackup:${AZURE_STORAGE_CONTAINER}/${PREFIX}/" | grep "^loom-${DATE//-/}" | sort | tail -1 || true)"
 mudlib_blob="$(rclone lsf "loombackup:${AZURE_STORAGE_CONTAINER}/${PREFIX}/" | grep "^mudlib-${DATE//-/}" | sort | tail -1 || true)"
+saves_blob="$(rclone lsf "loombackup:${AZURE_STORAGE_CONTAINER}/${PREFIX}/" | grep "^saves-${DATE//-/}" | sort | tail -1 || true)"
 [ -n "$dump_blob" ] || { echo "no dump found for ${DATE} under ${PREFIX}/" >&2; exit 1; }
 [ -n "$mudlib_blob" ] || { echo "no mudlib tarball found for ${DATE} under ${PREFIX}/" >&2; exit 1; }
+[ -n "$saves_blob" ] || { echo "no saves tarball found for ${DATE} under ${PREFIX}/" >&2; exit 1; }
 
-log "fetching $dump_blob and $mudlib_blob"
+log "fetching $dump_blob, $mudlib_blob and $saves_blob"
 rclone copy "loombackup:${AZURE_STORAGE_CONTAINER}/${PREFIX}/${dump_blob}" "$WORKDIR/"
 rclone copy "loombackup:${AZURE_STORAGE_CONTAINER}/${PREFIX}/${mudlib_blob}" "$WORKDIR/"
+rclone copy "loombackup:${AZURE_STORAGE_CONTAINER}/${PREFIX}/${saves_blob}" "$WORKDIR/"
 
 log "decrypting"
 age -d -i "$AGE_KEY" -o "$WORKDIR/loom.dump" "$WORKDIR/$dump_blob"
 age -d -i "$AGE_KEY" -o "$WORKDIR/mudlib.tar" "$WORKDIR/$mudlib_blob"
+age -d -i "$AGE_KEY" -o "$WORKDIR/saves.tar" "$WORKDIR/$saves_blob"
 
 log "starting scratch postgres:17-alpine (not the real postgres service)"
 docker run -d --name "$CONTAINER_NAME" \
@@ -126,4 +140,27 @@ docker exec -e PGPASSWORD=restore-drill "$CONTAINER_NAME" \
      psql -U loom -d loom -c "\dt"   # fall back to listing tables if `accounts` doesn't exist in this dump
 
 log "mudlib tarball: $(tar -tf "$WORKDIR/mudlib.tar" | wc -l) entries"
+
+# Unlike the dump (restored into a throwaway scratch container above),
+# the saves tarball goes straight into the real named docker volume
+# (OBI-172/OBI-241): there's no equivalent "throwaway loom" to restore
+# into, and files-on-a-volume restore is safe to do directly (the volume
+# itself is created by docker if missing, never touched if `loom` is
+# already running against it -- stop `loom` first per RUNBOOK.md §5 for
+# a real restore). A helper alpine container does the extract + chown,
+# the same uid/mode `saves-init` in compose.yaml uses.
+log "restoring saves tarball into docker volume '${SAVES_VOLUME}'"
+docker volume create "$SAVES_VOLUME" >/dev/null
+docker run --rm \
+  -v "${SAVES_VOLUME}:/saves" \
+  -v "$WORKDIR/saves.tar:/tmp/saves.tar:ro" \
+  alpine:3.20 /bin/sh -c '
+    set -eu
+    tar -C /saves -xf /tmp/saves.tar
+    chown -R 10001:10001 /saves
+    chmod 0700 /saves
+  '
+saves_entries="$(docker run --rm -v "${SAVES_VOLUME}:/saves:ro" alpine:3.20 find /saves -type f | wc -l)"
+log "saves volume '${SAVES_VOLUME}': ${saves_entries} files restored, owned by 10001"
+
 log "restore drill OK"
