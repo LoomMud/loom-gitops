@@ -131,7 +131,7 @@ jobs:
           # at WARP_REF, and nothing named `.git` anywhere under /mudlib
           # (GIT_SYNC_IMAGE carries `git`; the plain `alpine` used elsewhere
           # in this job does not).
-          docker run --rm -v loom_mudlib-git:/g -v loom_mudlib:/m "$GIT_SYNC_IMAGE" sh -c '
+          docker run --rm --entrypoint sh -v loom_mudlib-git:/g -v loom_mudlib:/m "$GIT_SYNC_IMAGE" -c '
             set -eu
             git --git-dir=/g/warp.git rev-parse --verify live^{commit} >/dev/null
             [ ! -e /m/.git ]
@@ -161,7 +161,7 @@ jobs:
           compose() {
             docker compose --env-file staging/images.env --env-file staging/secrets.env.example -f staging/compose.yaml "$@"
           }
-          live_sha() { docker run --rm -v loom_mudlib-git:/g "$GIT_SYNC_IMAGE" git --git-dir=/g/warp.git rev-parse live; }
+          live_sha() { docker run --rm -v loom_mudlib-git:/g "$GIT_SYNC_IMAGE" --git-dir=/g/warp.git rev-parse live; }
           mudlib_hash() { docker run --rm -v loom_mudlib:/m alpine sh -c 'find /m -type f | sort | xargs -r sha256sum' | sha256sum; }
           before_postgres_id="$(compose ps -q postgres)"
           before_live="$(live_sha)"
@@ -195,7 +195,7 @@ jobs:
           compose() {
             docker compose --env-file staging/images.env --env-file staging/secrets.env.example -f staging/compose.yaml "$@"
           }
-          live_sha() { docker run --rm -v loom_mudlib-git:/g "$GIT_SYNC_IMAGE" git --git-dir=/g/warp.git rev-parse live; }
+          live_sha() { docker run --rm -v loom_mudlib-git:/g "$GIT_SYNC_IMAGE" --git-dir=/g/warp.git rev-parse live; }
           mudlib_hash() { docker run --rm -v loom_mudlib:/m alpine sh -c 'find /m -type f | sort | xargs -r sha256sum' | sha256sum; }
           before_live="$(live_sha)"
           before_hash="$(mudlib_hash)"
