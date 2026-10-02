@@ -95,9 +95,15 @@ PGPASSWORD="${LOOM_OWNER_PASSWORD}" pg_dump -Fc -h postgres -U loom_owner -d loo
 log "archiving mudlib"
 tar -C /mudlib -cf "$WORKDIR/mudlib-${stamp}.tar" .
 
+# Character saves (OBI-172/OBI-241): mounted :ro, same as /mudlib, so a
+# compromised/buggy backup.sh can never write into the live saves volume.
+log "archiving saves"
+tar -C /saves -cf "$WORKDIR/saves-${stamp}.tar" .
+
 log "age-encrypting"
 age -r "$BACKUP_AGE_RECIPIENT" -o "$WORKDIR/loom-${stamp}.dump.age" "$WORKDIR/loom-${stamp}.dump"
 age -r "$BACKUP_AGE_RECIPIENT" -o "$WORKDIR/mudlib-${stamp}.tar.age" "$WORKDIR/mudlib-${stamp}.tar"
+age -r "$BACKUP_AGE_RECIPIENT" -o "$WORKDIR/saves-${stamp}.tar.age" "$WORKDIR/saves-${stamp}.tar"
 
 # rclone azureblob backend via an inline remote config (SETUP.md Appendix
 # A, R6-12): sas_url, no_check_container (the SAS can't create/inspect
@@ -120,6 +126,8 @@ rclone copy \
   "$WORKDIR/loom-${stamp}.dump.age" "loombackup:${AZURE_STORAGE_CONTAINER}/${prefix}/" 2>&1 | sed 's/^/  /'
 rclone copy \
   "$WORKDIR/mudlib-${stamp}.tar.age" "loombackup:${AZURE_STORAGE_CONTAINER}/${prefix}/" 2>&1 | sed 's/^/  /'
+rclone copy \
+  "$WORKDIR/saves-${stamp}.tar.age" "loombackup:${AZURE_STORAGE_CONTAINER}/${prefix}/" 2>&1 | sed 's/^/  /'
 
-log "done: ${prefix}/loom-${stamp}.dump.age, ${prefix}/mudlib-${stamp}.tar.age"
+log "done: ${prefix}/loom-${stamp}.dump.age, ${prefix}/mudlib-${stamp}.tar.age, ${prefix}/saves-${stamp}.tar.age"
 STATUS=success

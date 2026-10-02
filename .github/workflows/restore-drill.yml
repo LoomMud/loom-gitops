@@ -10,12 +10,16 @@
 # throwaway `age` keypair generated fresh for the run:
 #   1. staging/backup.sh (unmodified, run the way the `backup` compose
 #      service runs it: a one-off BACKUP_IMAGE container on the same
-#      docker network as `postgres`) dumps a seeded row, encrypts it, and
-#      uploads it to the emulator.
+#      docker network as `postgres`) dumps a seeded row, archives a seeded
+#      saves file (OBI-172/OBI-241), encrypts both plus the (empty)
+#      mudlib stub, and uploads them to the emulator.
 #   2. staging/restore.sh (unmodified) fetches that backup, decrypts it
-#      with the private half of the throwaway age key, restores it into a
-#      scratch `postgres:17-alpine` container, and runs its smoke query.
-#   3. The smoke query's row count matches what was seeded.
+#      with the private half of the throwaway age key, restores the dump
+#      into a scratch `postgres:17-alpine` container and the saves
+#      tarball into a disposable docker volume, and runs its smoke query.
+#   3. The smoke query's row count matches what was seeded, and the saves
+#      file comes back out of the restored volume byte-for-byte, owned by
+#      10001.
 #
 # Azurite's blob emulator always answers as `https://<account>.blob.core.
 # windows.net/...` requests would (both scripts hard-code that hostname
@@ -188,6 +192,17 @@ jobs:
             psql -U loom_owner -d loom -v ON_ERROR_STOP=1 -c \
             "create table accounts (id serial primary key, note text); insert into accounts(note) values ('restore-drill-seed');"
 
+      # Character saves (OBI-172/OBI-241): a stub file standing in for a
+      # real .o save (loom#75/warp#14), seeded the same way the dump's
+      # accounts row is seeded above -- backup.sh archives whatever is
+      # under /saves verbatim, it doesn't know or care about the loom
+      # save format.
+      - name: seed a known saves file
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/saves-stub/players"
+          echo "restore-drill-seed" > "$RUNNER_TEMP/saves-stub/players/drill.o"
+
       # backup.sh itself (unmodified) run the way the `backup` compose
       # service runs it (compose.yaml: image=BACKUP_IMAGE,
       # entrypoint=/scripts/backup.sh) -- a one-off container on the same
@@ -211,6 +226,7 @@ jobs:
             -e RCLONE_NO_CHECK_CERTIFICATE=true \
             -v "$PWD/staging/backup.sh:/scripts/backup.sh:ro" \
             -v "$RUNNER_TEMP/mudlib-stub:/mudlib:ro" \
+            -v "$RUNNER_TEMP/saves-stub:/saves:ro" \
             "$BACKUP_IMAGE" /bin/sh /scripts/backup.sh | tee "$RUNNER_TEMP/backup.log"
           grep -q '^.* backup: done: ' "$RUNNER_TEMP/backup.log"
           # Mirrors backup.sh's own dow->prefix logic (RUNBOOK.md §6): the
@@ -231,16 +247,38 @@ jobs:
           export AZURE_STORAGE_CONTAINER="$AZURE_CONTAINER"
           export AZURE_STORAGE_SAS_TOKEN="$AZURE_SAS"
           date="$(date -u '+%Y-%m-%d')"
+          # --saves-volume: a disposable, run-unique docker volume name
+          # (restore.sh's own default of "saves" is deliberately not used
+          # here, see RUNBOOK.md §6 -- a shared GitHub-hosted runner must
+          # never let two drills collide on the same volume name).
+          saves_volume="loom-restore-drill-saves-${{ github.run_id }}"
+          echo "SAVES_VOLUME=$saves_volume" >> "$GITHUB_ENV"
           staging/restore.sh --age-key "$AGE_KEY_FILE" --prefix "$PREFIX" --date "$date" \
+            --saves-volume "$saves_volume" \
             | tee "$RUNNER_TEMP/restore.log"
           grep -q 'restore drill OK' "$RUNNER_TEMP/restore.log"
           count_line="$(awk '/^ accounts/{getline; getline; print; exit}' "$RUNNER_TEMP/restore.log" | tr -d ' ')"
           [ "$count_line" = "1" ] || { echo "expected accounts count 1, got: '$count_line'"; exit 1; }
           echo "restore drill smoke query: accounts=$count_line (expected 1, matches the seeded row)"
 
+      # Character saves (OBI-172/OBI-241): the file seeded before backup.sh
+      # ran must come back out of the volume restore.sh just populated,
+      # byte-for-byte, with the 10001 ownership saves-init/restore.sh both
+      # apply -- not just "restore.sh exited 0".
+      - name: assert saves file survived the round trip
+        run: |
+          set -euo pipefail
+          content="$(docker run --rm -v "${SAVES_VOLUME}:/saves:ro" alpine:3.20 cat /saves/players/drill.o)"
+          [ "$content" = "restore-drill-seed" ] || { echo "expected 'restore-drill-seed', got: '$content'"; exit 1; }
+          owner="$(docker run --rm -v "${SAVES_VOLUME}:/saves:ro" alpine:3.20 stat -c '%u:%g' /saves/players/drill.o)"
+          [ "$owner" = "10001:10001" ] || { echo "expected saves file owned by 10001:10001, got: $owner"; exit 1; }
+          echo "saves file survived restore, content matches, owned by $owner"
+          docker volume rm "$SAVES_VOLUME" >/dev/null
+
       - name: cleanup
         if: always()
         run: |
           docker compose --env-file staging/images.env --env-file staging/secrets.env.example -f staging/compose.yaml down -v || true
           docker rm -f azurite || true
+          docker volume rm "${SAVES_VOLUME:-}" >/dev/null 2>&1 || true
           shred -u "$RUNNER_TEMP/drill-age-key.txt" 2>/dev/null || true
