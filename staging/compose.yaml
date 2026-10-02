@@ -39,8 +39,17 @@ services:
       # loom-persist/migrations/0001_init.sql). Never the superuser and
       # never loom_owner (that login is for migrations only, below).
       DATABASE_URL: postgres://loom_app:${LOOM_APP_PASSWORD}@loom-db:5432/loom
+      # Character saves (save_object/restore_object, loom OBI-171; warp
+      # OBI-172). Without this the driver defaults to <mudlib>/../saves,
+      # i.e. /saves in the container's own (non-persistent) filesystem,
+      # which the loom user can't even write -- every save would fail and
+      # characters would be lost on each restart. Kept out of the `mudlib`
+      # volume on purpose: mudlib-sync resets that one on every WARP_REF
+      # bump (D-P1.11), and saves must never be part of the mudlib tree.
+      LOOM_SAVE_DIR: /saves
     volumes:
       - mudlib:/mudlib:ro
+      - saves:/saves
     ports:
       # Telnet: published directly (D-P1.14), not proxied by Caddy or
       # Cloudflare (SETUP.md §5.3).
@@ -70,6 +79,8 @@ services:
       # manual step -- `docker compose up -d` always applies pending
       # loom_owner migrations before `loom` starts.
       migrate:
+        condition: service_completed_successfully
+      saves-init:
         condition: service_completed_successfully
 
   caddy:
@@ -171,6 +182,24 @@ services:
         rm -rf /mudlib/.git
         echo "${WARP_REF}" > /mudlib/.warp-ref
         echo "mudlib-sync: done, at ${WARP_REF}"
+
+  # One-shot (OBI-172): a new named volume is created root-owned, but the
+  # loom image runs as the unprivileged `loom` user (uid 10001, loom's
+  # Dockerfile), so hand the `saves` volume's root to that uid before
+  # `loom` starts. Idempotent: a no-op chown/chmod on every later `up`.
+  # Never touches what is inside the volume.
+  saves-init:
+    image: ${GIT_SYNC_IMAGE}
+    restart: "no"
+    volumes:
+      - saves:/saves
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        chown 10001:10001 /saves
+        chmod 0700 /saves
+        echo "saves-init: /saves owned by 10001, mode 0700"
 
   # One-shot migration runner (D-27.4, OBI-130/OBI-138): applies
   # loom-persist's sqlx migrations as `loom_owner`, the schema owner --
@@ -276,6 +305,10 @@ services:
 volumes:
   pgdata:
   mudlib:
+  # Character saves (OBI-172). Survives container recreation and WARP_REF
+  # bumps; only `compose down -v` removes it. Not in the nightly backup
+  # yet (follow-up tracked on the OBI-172 thread).
+  saves:
   caddy-data:
   caddy-config:
   prometheus-data:
