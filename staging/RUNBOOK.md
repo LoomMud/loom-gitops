@@ -115,8 +115,8 @@ Blob backups are configured and have at least one nightly run:
    ```bash
    sudo systemctl stop loom-reconcile.timer
    ```
-   Restore postgres and saves in the **same** stop window (steps 3-5
-   below), then restart the timer at the end of step 5.
+   Restore postgres and saves in the **same** stop window (steps 4-6
+   below), then restart the timer at the end of step 6.
 4. Restore the Postgres dump against the **real** bucket and the **real**
    age private key, restoring into the actual `postgres` service this
    time (not a scratch container): stop `loom`, `pg_restore` into the
