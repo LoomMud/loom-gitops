@@ -17,6 +17,19 @@
 #     aren't silently missed while the dispatch wiring above doesn't
 #     exist. Harmless/no-op (no PR) if nothing new was published.
 #   - workflow_dispatch: manual run.
+#
+# PR identity (retro R4, OBI-178/P2-C4): the bump PR is opened with a
+# GitHub App installation token, never a personal/shared PAT (OBI-142),
+# and the commit author is pinned to that same App's bot identity so it
+# matches the hardcoded Signed-off-by trailer and the dco check passes
+# without manual fixes. This needs two repo secrets --
+# BUMP_STAGING_APP_ID and BUMP_STAGING_APP_PRIVATE_KEY -- for a GitHub
+# App installed on LoomMud/loom-gitops with `contents: write` and
+# `pull_requests: write`. Until those secrets exist, every step below
+# degrades to the previous behaviour (github.token + the literal
+# `bump-staging[bot] <noreply@paperclip.ing>` identity from OBI-155) so
+# this workflow keeps bumping staging either way; nothing regresses
+# while the App is provisioned.
 name: bump-staging
 
 on:
@@ -37,6 +50,59 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Check for GitHub App credentials
+        id: check-app
+        env:
+          APP_ID: ${{ secrets.BUMP_STAGING_APP_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.BUMP_STAGING_APP_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -n "$APP_ID" ] && [ -n "$APP_PRIVATE_KEY" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::BUMP_STAGING_APP_ID/BUMP_STAGING_APP_PRIVATE_KEY are not set; falling back to github.token and the OBI-155 literal bot identity (OBI-178 not fully wired up yet)."
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate GitHub App installation token
+        id: app-token
+        if: steps.check-app.outputs.configured == 'true'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.BUMP_STAGING_APP_ID }}
+          private-key: ${{ secrets.BUMP_STAGING_APP_PRIVATE_KEY }}
+          owner: LoomMud
+          repositories: loom-gitops
+
+      # The commit author/Signed-off-by must be the App's own bot login
+      # (`<slug>[bot]`) and its numeric-id noreply email, or the dco check
+      # on the PR this workflow opens fails exactly like it did in OBI-155
+      # (create-pull-request otherwise defaults the committer to whichever
+      # identity triggered the run). Derived from the token instead of
+      # hardcoded, so this keeps working if the App is ever renamed or
+      # replaced.
+      - name: Resolve GitHub App bot identity
+        id: bot-identity
+        if: steps.check-app.outputs.configured == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          slug="${{ steps.app-token.outputs.app-slug }}"
+          user_id="$(gh api "/users/${slug}[bot]" --jq .id)"
+          echo "login=${slug}[bot]" >> "$GITHUB_OUTPUT"
+          echo "email=${user_id}+${slug}[bot]@users.noreply.github.com" >> "$GITHUB_OUTPUT"
+
+      - name: Compute bot identity string
+        id: identity
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.check-app.outputs.configured }}" = "true" ]; then
+            echo "ident=${{ steps.bot-identity.outputs.login }} <${{ steps.bot-identity.outputs.email }}>" >> "$GITHUB_OUTPUT"
+          else
+            echo "ident=bump-staging[bot] <noreply@paperclip.ing>" >> "$GITHUB_OUTPUT"
+          fi
 
       # OBI-42/OBI-157 gap: staging/reconcile.sh already posts a red
       # `staging/reconcile` commit status on failure (see reconcile.sh's
@@ -139,20 +205,28 @@ jobs:
         if: steps.update.outputs.changed == 'true'
         uses: peter-evans/create-pull-request@5e914681df9dc83aa4e4905692ca88beb2f9e91f # v7.0.5
         with:
-          token: ${{ github.token }}
+          # GitHub App installation token when BUMP_STAGING_APP_ID/
+          # BUMP_STAGING_APP_PRIVATE_KEY are configured (OBI-178/P2-C4:
+          # never the shared PAT, D-P2.4's same rule applied to this
+          # workflow); github.token otherwise, matching the pre-OBI-178
+          # behaviour until the App is provisioned.
+          token: ${{ steps.app-token.outputs.token || github.token }}
           branch: bump-staging/loom-${{ steps.find.outputs.tag }}
           delete-branch: true
           # Explicit author, matching the Signed-off-by trailer below
-          # exactly (OBI-155): without this the action defaults the commit
-          # author to whichever identity triggered the run (workflow_dispatch
-          # takes github.actor; that isn't a fixed bot until per-agent GitHub
-          # identities land, OBI-43), which mismatches the hardcoded
-          # Signed-off-by trailer and fails the dco check on the PR it opens.
-          author: "bump-staging[bot] <noreply@paperclip.ing>"
+          # exactly (OBI-155, extended by OBI-178): without this the action
+          # defaults the commit author to whichever identity triggered the
+          # run (workflow_dispatch takes github.actor; a GitHub App token
+          # defaults to the App's own bot login, but we pin it explicitly
+          # here so author and Signed-off-by are always byte-identical),
+          # which otherwise mismatches the Signed-off-by trailer and fails
+          # the dco check on the PR it opens.
+          author: "${{ steps.identity.outputs.ident }}"
+          committer: "${{ steps.identity.outputs.ident }}"
           commit-message: |
             staging: bump LOOM_IMAGE to ${{ steps.find.outputs.tag }}
 
-            Signed-off-by: bump-staging[bot] <noreply@paperclip.ing>
+            Signed-off-by: ${{ steps.identity.outputs.ident }}
           title: "staging: bump LOOM_IMAGE to ${{ steps.find.outputs.tag }}"
           body: |
             Automated bump (D-P1.9). Newest signed pre-release digest for
