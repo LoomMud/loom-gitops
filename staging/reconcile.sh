@@ -83,6 +83,33 @@ compose() {
     -f "$STAGING_DIR/compose.yaml" "$@"
 }
 
+# 1.5. B3/OBI-192 (D-B3.11/D-B3.12, loom-gitops#36 review B2): compose's
+# `secrets:` entries need *some* file at these host paths or `up` fails
+# outright, and nothing installs the real ones automatically (they're
+# gitignored, provisioned by hand once Q-P2.3 lands -- RUNBOOK.md §11).
+# Install the tracked `*.example` placeholders the first time either real
+# file is missing, so a fresh host's first reconcile doesn't fail on this.
+# Never overwrites a file that's already there (real or previously
+# installed). Owner is numeric uid 10001, not whatever uid this script's
+# own `loom` user has (B3: plain non-swarm compose bind-mounts secrets
+# as-is, so the container's `loom` user, uid 10001, can only read a file
+# actually owned by that uid) -- `chown` via a throwaway root container on
+# the already-pulled $GIT_SYNC_IMAGE, the same trick mudlib-sync itself
+# uses to hand the seeded mudlib tree to that uid.
+install_placeholder_secret() {
+  local name="$1" real example
+  real="$STAGING_DIR/secrets/$name"
+  example="$STAGING_DIR/secrets/${name}.example"
+  [ -f "$real" ] && return 0
+  install -m 0400 "$example" "$real"
+  docker run --rm -v "$STAGING_DIR/secrets:/s" "$GIT_SYNC_IMAGE" \
+    sh -c "chown 10001:10001 '/s/$name'" \
+    || fail "could not chown placeholder secret $name to uid 10001"
+  log "installed placeholder secret $name from ${name}.example (real App not yet provisioned, Q-P2.3; see RUNBOOK.md section 11)"
+}
+install_placeholder_secret warp_app.pem
+install_placeholder_secret warp_webhook
+
 # GHCR login fallback (SETUP.md §8.2/R6-7): only if the package is still
 # private and a classic PAT was provisioned. A no-op, idempotent step.
 if [ -n "${GHCR_TOKEN:-}" ]; then

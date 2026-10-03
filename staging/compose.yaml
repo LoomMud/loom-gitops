@@ -186,6 +186,21 @@ services:
   # is bootstrap-only after the first seed (RUNBOOK.md). A reset here
   # would silently discard every live builder edit, which is exactly the
   # bug class B3 exists to close.
+  #
+  # loom-gitops#36 review (B1/S1 fixes): staging's `mudlib` volume predates
+  # B3 and already holds a pre-B3 tree + `.warp-ref` (D-P1.11) the first
+  # time this runs there -- `git checkout` onto a non-empty work tree
+  # aborts ("untracked working tree files would be overwritten"), and
+  # worse, `git init` had already written `warp.git/HEAD` by that point, so
+  # the *next* reconcile would hit the no-op fast path above with no
+  # `live` branch at all. Fixed by building the bare repo in a scratch dir
+  # and `mv`-ing it into place only after checkout + chown succeed (so a
+  # crash mid-seed never leaves a false-positive `HEAD` behind), and by
+  # clearing `/mudlib` before checkout -- safe, because reaching that line
+  # means no `GIT_DIR` existed yet, i.e. either a genuinely empty volume
+  # or the pre-B3 regime (mounted `:ro`, so it can't hold builder edits).
+  # Also drops `--depth 1`: loom-git (OBI-190) merges `origin/main` into
+  # `live`, which needs a real merge base, not a single shallow commit.
   mudlib-sync:
     image: ${GIT_SYNC_IMAGE}
     restart: "no"
@@ -211,11 +226,23 @@ services:
           exit 0
         fi
         echo "mudlib-sync: seeding $$git_dir + /mudlib from ${WARP_REPO} @ ${WARP_REF}"
-        git init --quiet --bare -b main "$$git_dir"
-        git --git-dir="$$git_dir" remote add origin "${WARP_REPO}"
-        git --git-dir="$$git_dir" fetch --quiet --depth 1 origin "${WARP_REF}"
-        git --git-dir="$$git_dir" --work-tree=/mudlib checkout --quiet -b live FETCH_HEAD
-        chown -R "${LOOM_UID}:${LOOM_UID}" /mudlib /mudlib-git
+        tmp_git_dir=/mudlib-git/warp.git.tmp
+        rm -rf "$$tmp_git_dir"
+        git init --quiet --bare -b main "$$tmp_git_dir"
+        git --git-dir="$$tmp_git_dir" remote add origin "${WARP_REPO}"
+        git --git-dir="$$tmp_git_dir" fetch --quiet origin '+refs/heads/*:refs/remotes/origin/*'
+        target="$$(git --git-dir="$$tmp_git_dir" rev-parse --verify --quiet "${WARP_REF}^{commit}" || true)"
+        if [ -z "$$target" ]; then
+          # WARP_REF may be a SHA that isn't any current branch tip (e.g. a
+          # since-deleted branch); GitHub allows fetching an exact
+          # reachable SHA directly even without --depth.
+          git --git-dir="$$tmp_git_dir" fetch --quiet origin "${WARP_REF}"
+          target="$$(git --git-dir="$$tmp_git_dir" rev-parse --verify FETCH_HEAD^{commit})"
+        fi
+        find /mudlib -mindepth 1 -delete
+        git --git-dir="$$tmp_git_dir" --work-tree=/mudlib checkout --quiet -b live "$$target"
+        chown -R "${LOOM_UID}:${LOOM_UID}" /mudlib "$$tmp_git_dir"
+        mv "$$tmp_git_dir" "$$git_dir"
         echo "mudlib-sync: done, live at $$(git --git-dir="$$git_dir" rev-parse live)"
 
   # One-shot (OBI-172): a new named volume is created root-owned, but the
@@ -362,10 +389,14 @@ volumes:
   grafana-data:
 
 # OBI-192/B3.5 (D-B3.11/D-B3.12): file-based secrets (plain `docker
-# compose`, not swarm -- `mode:` above is honoured by the newer Compose v2
-# file-secret path; even where it isn't, SETUP.md has the host file itself
-# at 0400, owned by the loom uid, which is the enforcement that actually
-# matters). Real values never get committed -- see .gitignore and
+# compose`, not swarm): loom-gitops#36 review (B3) -- `mode:`/`target:`
+# above are bind-mount hints only; plain (non-swarm) Compose does not
+# translate them, so the enforcement that actually matters is the *host*
+# file's own owner/mode: 0400, owned by numeric uid 10001 (the container's
+# `loom` user, Dockerfile `useradd --uid 10001`) -- not whatever uid the
+# host's own `loom` service account happens to have. See RUNBOOK.md §11
+# and reconcile.sh (placeholder install) for how that ownership is set.
+# Real values never get committed -- see .gitignore and
 # staging/secrets/*.example.
 secrets:
   warp_app_pem:

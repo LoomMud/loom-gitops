@@ -105,6 +105,23 @@ jobs:
       # blocked on OBI-109), so "full" is postgres + mudlib-sync -- the two
       # services these checks are about. That gap is tracked, not hidden:
       # see the loom/caddy pull step below.
+      - name: pre-populate /mudlib with a pre-B3 (D-P1.11) tree -- migration regression guard (B1)
+        run: |
+          set -euo pipefail
+          . staging/images.env
+          # loom-gitops#36 review (B1): staging's real `mudlib` volume predates
+          # B3 and already holds a read-only tree + `.warp-ref` (the old
+          # D-P1.11 reset-on-bump marker) the first time mudlib-sync's
+          # seed-only logic runs there. Reproduce that here: an untracked
+          # file plus `.warp-ref`, created before boot 1 ever runs, so this
+          # is a real regression guard for "seeding over an existing
+          # pre-B3 volume", not just an empty-volume happy path.
+          docker volume create loom_mudlib >/dev/null
+          docker run --rm -v loom_mudlib:/m alpine sh -c '
+            set -eu
+            echo "pre-B3 leftover" > /m/some-pre-existing-file.txt
+            echo 618b90c6a1e18a215f6c44af4ea1efbd7912e93e > /m/.warp-ref
+          '
       - name: up -d (boot 1) -- seeds /mudlib-git/warp.git + /mudlib
         env:
           # OBI-130 DB role separation: three throwaway CI passwords, one per
@@ -128,13 +145,17 @@ jobs:
           mudlib_sync_cid="$(docker compose --env-file staging/images.env --env-file staging/secrets.env.example -f staging/compose.yaml ps -a -q mudlib-sync)"
           [ "$(docker inspect -f '{{.State.ExitCode}}' "$mudlib_sync_cid")" = 0 ] || { docker compose --env-file staging/images.env --env-file staging/secrets.env.example -f staging/compose.yaml logs mudlib-sync; exit 1; }
           # D-B3.6/D-B3.2: a real GIT_DIR at /mudlib-git/warp.git with `live`
-          # at WARP_REF, and nothing named `.git` anywhere under /mudlib
-          # (GIT_SYNC_IMAGE carries `git`; the plain `alpine` used elsewhere
-          # in this job does not).
+          # at WARP_REF, nothing named `.git` anywhere under /mudlib, and
+          # (B1 regression guard) the pre-B3 leftovers seeded above --
+          # including `.warp-ref` -- are gone, not merely left alongside the
+          # freshly checked-out tree (GIT_SYNC_IMAGE carries `git`; the
+          # plain `alpine` used elsewhere in this job does not).
           docker run --rm --entrypoint sh -v loom_mudlib-git:/g -v loom_mudlib:/m "$GIT_SYNC_IMAGE" -c '
             set -eu
             git --git-dir=/g/warp.git rev-parse --verify live^{commit} >/dev/null
             [ ! -e /m/.git ]
+            [ ! -e /m/.warp-ref ]
+            [ ! -e /m/some-pre-existing-file.txt ]
             [ -n "$(ls -A /m)" ]
           '
           # OBI-130: both least-privilege logins authenticate over TCP (password

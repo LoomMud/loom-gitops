@@ -433,20 +433,37 @@ needs revisiting.
 
 ```bash
 sudo install -d -o loom -g loom -m 0750 /opt/loom-gitops/staging/secrets
-sudo install -o loom -g loom -m 0400 /dev/null /opt/loom-gitops/staging/secrets/warp_app.pem
-sudo install -o loom -g loom -m 0400 /dev/null /opt/loom-gitops/staging/secrets/warp_webhook
+sudo install -o 10001 -g 10001 -m 0400 /dev/null /opt/loom-gitops/staging/secrets/warp_app.pem
+sudo install -o 10001 -g 10001 -m 0400 /dev/null /opt/loom-gitops/staging/secrets/warp_webhook
 sudoedit /opt/loom-gitops/staging/secrets/warp_app.pem      # the loom-warp-propose GitHub App's private key (PEM)
 sudoedit /opt/loom-gitops/staging/secrets/warp_webhook      # `openssl rand -hex 32`; also set as the App's webhook secret
-sudo stat -c '%U:%G %a' /opt/loom-gitops/staging/secrets/warp_app.pem /opt/loom-gitops/staging/secrets/warp_webhook   # expect: loom:loom 400
+sudo stat -c '%U:%G %a' /opt/loom-gitops/staging/secrets/warp_app.pem /opt/loom-gitops/staging/secrets/warp_webhook   # expect: 10001:10001 400
 ```
+
+**Owner is numeric uid `10001`, not the host `loom` account (loom-gitops#36
+review, B3).** Plain (non-swarm) `docker compose` bind-mounts file secrets
+as-is -- `mode:`/uid in `compose.yaml` are swarm-only fields that this
+stack doesn't get, so what the `loom` *container* (uid 10001, Dockerfile
+`useradd --uid 10001`) can actually read is whatever the host file's own
+owner/mode already are. The host's `loom` service account (SETUP.md §3.3)
+is a different, unrelated uid -- `chown`ing to it instead would leave
+these files unreadable inside the container despite looking "correctly"
+owned on the host. `sudoedit` preserves the original owner/mode when it
+writes the file back, so the numeric ownership from `install` above
+survives editing.
 
 **Both are placeholders until Q-P2.3 is answered** (board decision: a new
 `loom-warp-propose` App, install the reviewer App on `warp` too, raise
 `main` to 1 required approval -- see the design doc §9). Until then,
-leave the `*.example` files uninstalled (or install them verbatim) --
-`loom-git` treats a missing/placeholder App config the same as "no App
-configured": push and `propose` are disabled, logged once at boot, and
-everything else (auto-commit to `live`, local history) still works.
+`staging/reconcile.sh` installs the tracked `*.example` files as
+0400/uid-10001 placeholders itself (loom-gitops#36 review, B2) the first
+time it finds either real file missing, logging that once -- so a fresh
+host never fails `compose up` for a missing `secrets:` target, and you
+can still install the real files yourself at any time (the reconciler
+never overwrites a file that's already there). `loom-git` treats a
+missing/placeholder App config the same as "no App configured": push and
+`propose` are disabled, logged once at boot, and everything else
+(auto-commit to `live`, local history) still works.
 Also fill in `LOOM_GIT_APP_ID`/`LOOM_GIT_INSTALLATION_ID` (and
 `LOOM_GIT_REPO` if it's ever not `LoomMud/warp`) in `secrets.env` once
 the App exists; `compose.yaml` passes them through as
