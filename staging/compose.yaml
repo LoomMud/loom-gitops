@@ -24,9 +24,16 @@ services:
     command: ["serve", "--mudlib", "/mudlib"]
     labels:
       # Not read by anything. It puts WARP_REF into this service's config
-      # hash, so `up -d` recreates loom when the mudlib ref moves.
-      # Otherwise mudlib-sync swaps the volume under a running driver that
-      # keeps the old master loaded (seen on the OBI-148 rollout, OBI-152).
+      # hash, so `up -d` recreates loom when the mudlib ref moves (OBI-152:
+      # otherwise mudlib-sync would swap the volume under a running driver
+      # that keeps the old master loaded). B3.5/OBI-192 (D-B3.6): since
+      # mudlib-sync is now seed-only, this label only fires a real
+      # (harmless) recreate on an *unseeded* volume's first boot --
+      # WARP_REF is the bootstrap ref only; editing it after the first
+      # seed does not move the mudlib (there is no reset left to race) and
+      # recreating loom for that edit alone would be exactly the
+      # unintended restart the driver's copyover story exists to avoid.
+      # Left in place for the pre-seed case rather than removed.
       org.loommud.warp-ref: ${WARP_REF}
     environment:
       LOOM_TELNET_ADDR: 0.0.0.0:4000
@@ -44,11 +51,36 @@ services:
       # i.e. /saves in the container's own (non-persistent) filesystem,
       # which the loom user can't even write -- every save would fail and
       # characters would be lost on each restart. Kept out of the `mudlib`
-      # volume on purpose: mudlib-sync resets that one on every WARP_REF
-      # bump (D-P1.11), and saves must never be part of the mudlib tree.
+      # volume on purpose: it's a separate volume/concern from the Git
+      # working tree below, and must never be part of the mudlib tree.
       LOOM_SAVE_DIR: /saves
+      # loom-git (B3.5/OBI-192, D-B3.6/D-B3.11): the driver owns a writable
+      # Git working tree after the first seed (mudlib-sync, below) instead
+      # of a read-only pinned checkout. GIT_DIR is the separate
+      # `mudlib-git` volume (D-B3.2) -- nothing named `.git` ever exists
+      # under `/mudlib`. With no App configured (secrets are placeholders
+      # until Q-P2.3), loom-git logs a warning at boot and runs with
+      # push/propose disabled -- see staging/RUNBOOK.md.
+      LOOM_GIT_ENV: staging
+      LOOM_GIT_APP_ID: ${LOOM_GIT_APP_ID:-}
+      LOOM_GIT_INSTALLATION_ID: ${LOOM_GIT_INSTALLATION_ID:-}
+      LOOM_GIT_REPO: ${LOOM_GIT_REPO:-LoomMud/warp}
+    secrets:
+      # D-B3.11: the GitHub App private key, mounted read-only at exactly
+      # `/run/secrets/warp_app.pem` and never passed any other way (not
+      # argv, not an env var, not the VFS). Placeholder content until
+      # Q-P2.3 provisions the real App (SETUP.md); loom-git treats a
+      # missing/placeholder key the same as "no App configured".
+      - source: warp_app_pem
+        target: warp_app.pem
+        mode: 0400
+      # D-B3.12: the webhook HMAC secret for `POST /api/v1/hooks/github`.
+      - source: warp_webhook
+        target: warp_webhook
+        mode: 0400
     volumes:
-      - mudlib:/mudlib:ro
+      - mudlib:/mudlib
+      - mudlib-git:/mudlib-git
       - saves:/saves
     ports:
       # Telnet: published directly (D-P1.14), not proxied by Caddy or
@@ -142,46 +174,76 @@ services:
       timeout: 5s
       retries: 10
 
-  # One-shot: checks out LoomMud/warp at WARP_REF into the `mudlib` volume
-  # (D-P1.11). Exits 0 on success; `loom` and `caddy` wait for that via
-  # `depends_on: ... condition: service_completed_successfully`. Re-runs
-  # (and container-recreates) only when WARP_REF or WARP_REPO changes,
-  # because those are baked into its environment (part of the container's
-  # config hash that `docker compose up` diffs). The script itself is
-  # idempotent even if run again unprompted: it resets the volume only
-  # when the checked-out commit doesn't already match WARP_REF. Because
-  # `.git` is stripped from the volume after checkout (D-P1.11 wants a
-  # plain tree, not a repo), idempotency is tracked by a `.warp-ref`
-  # marker file written after a successful checkout -- not by re-deriving
-  # the commit from `.git`, which no longer exists (loom-gitops#8 review).
+  # Seed-only (D-B3.6/B3.5, OBI-192 -- supersedes the D-P1.11 reset-on-bump
+  # behaviour below once a tree exists): the first time this runs,
+  # `/mudlib-git/warp.git` does not exist, so it clones `WARP_REPO`,
+  # creates `live` at `WARP_REF`, and checks it out into the separate
+  # `/mudlib` work tree (D-B3.2: `GIT_DIR` and the work tree are always
+  # distinct -- nothing named `.git` ever appears under `/mudlib`). Every
+  # run after that -- including a `WARP_REF` bump in `images.env` -- is a
+  # pure no-op: the driver owns the tree from here on (`loom-git`'s
+  # `GitWorker`, auto-commits, sync off GitHub's `main`), and WARP_REF
+  # is bootstrap-only after the first seed (RUNBOOK.md). A reset here
+  # would silently discard every live builder edit, which is exactly the
+  # bug class B3 exists to close.
+  #
+  # loom-gitops#36 review (B1/S1 fixes): staging's `mudlib` volume predates
+  # B3 and already holds a pre-B3 tree + `.warp-ref` (D-P1.11) the first
+  # time this runs there -- `git checkout` onto a non-empty work tree
+  # aborts ("untracked working tree files would be overwritten"), and
+  # worse, `git init` had already written `warp.git/HEAD` by that point, so
+  # the *next* reconcile would hit the no-op fast path above with no
+  # `live` branch at all. Fixed by building the bare repo in a scratch dir
+  # and `mv`-ing it into place only after checkout + chown succeed (so a
+  # crash mid-seed never leaves a false-positive `HEAD` behind), and by
+  # clearing `/mudlib` before checkout -- safe, because reaching that line
+  # means no `GIT_DIR` existed yet, i.e. either a genuinely empty volume
+  # or the pre-B3 regime (mounted `:ro`, so it can't hold builder edits).
+  # Also drops `--depth 1`: loom-git (OBI-190) merges `origin/main` into
+  # `live`, which needs a real merge base, not a single shallow commit.
   mudlib-sync:
     image: ${GIT_SYNC_IMAGE}
     restart: "no"
     environment:
       WARP_REPO: ${WARP_REPO}
       WARP_REF: ${WARP_REF}
+      # Matches the loom image's `loom` user (Dockerfile: `useradd
+      # --system --uid 10001`). This container runs as root (the
+      # upstream alpine/git image sets no USER), so the tree it seeds
+      # must be handed to that uid before `loom` -- which never runs as
+      # root -- can write to it.
+      LOOM_UID: ${LOOM_UID:-10001}
     volumes:
       - mudlib:/mudlib
+      - mudlib-git:/mudlib-git
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
         set -eu
-        echo "mudlib-sync: target ${WARP_REPO} @ ${WARP_REF}"
-        current=""
-        if [ -f /mudlib/.warp-ref ]; then
-          current=$$(cat /mudlib/.warp-ref 2>/dev/null || echo "")
-        fi
-        if [ "$$current" = "${WARP_REF}" ]; then
-          echo "mudlib-sync: already at ${WARP_REF}, no reset needed"
+        git_dir=/mudlib-git/warp.git
+        if [ -f "$$git_dir/HEAD" ]; then
+          echo "mudlib-sync: $$git_dir already seeded, no-op (D-B3.6)"
           exit 0
         fi
-        echo "mudlib-sync: resetting volume (had: $${current:-<empty>})"
-        rm -rf /mudlib/* /mudlib/.[!.]* 2>/dev/null || true
-        git clone --no-checkout "${WARP_REPO}" /mudlib
-        git -C /mudlib checkout --detach "${WARP_REF}"
-        rm -rf /mudlib/.git
-        echo "${WARP_REF}" > /mudlib/.warp-ref
-        echo "mudlib-sync: done, at ${WARP_REF}"
+        echo "mudlib-sync: seeding $$git_dir + /mudlib from ${WARP_REPO} @ ${WARP_REF}"
+        tmp_git_dir=/mudlib-git/warp.git.tmp
+        rm -rf "$$tmp_git_dir"
+        git init --quiet --bare -b main "$$tmp_git_dir"
+        git --git-dir="$$tmp_git_dir" remote add origin "${WARP_REPO}"
+        git --git-dir="$$tmp_git_dir" fetch --quiet origin '+refs/heads/*:refs/remotes/origin/*'
+        target="$$(git --git-dir="$$tmp_git_dir" rev-parse --verify --quiet "${WARP_REF}^{commit}" || true)"
+        if [ -z "$$target" ]; then
+          # WARP_REF may be a SHA that isn't any current branch tip (e.g. a
+          # since-deleted branch); GitHub allows fetching an exact
+          # reachable SHA directly even without --depth.
+          git --git-dir="$$tmp_git_dir" fetch --quiet origin "${WARP_REF}"
+          target="$$(git --git-dir="$$tmp_git_dir" rev-parse --verify FETCH_HEAD^{commit})"
+        fi
+        find /mudlib -mindepth 1 -delete
+        git --git-dir="$$tmp_git_dir" --work-tree=/mudlib checkout --quiet -b live "$$target"
+        chown -R "${LOOM_UID}:${LOOM_UID}" /mudlib "$$tmp_git_dir"
+        mv "$$tmp_git_dir" "$$git_dir"
+        echo "mudlib-sync: done, live at $$(git --git-dir="$$git_dir" rev-parse live)"
 
   # One-shot (OBI-172): a new named volume is created root-owned, but the
   # loom image runs as the unprivileged `loom` user (uid 10001, loom's
@@ -245,6 +307,10 @@ services:
       # Character saves (OBI-172/OBI-241): read-only, same reasoning as
       # the mudlib mount above -- backup.sh only ever reads this volume.
       - saves:/saves:ro
+      # OBI-192/B3.5 (D-B3.6): the driver's own Git history, a second copy
+      # of everything `live/<env>` already has on GitHub but also the
+      # fastest way to rebuild a host without a network dependency.
+      - mudlib-git:/mudlib-git:ro
       # OBI-175 (P2-O4): shared with the `alerts` service below so its
       # backup-failure check can read what this run reported. A plain
       # bind mount under staging/ (not a named volume), same pattern as
@@ -312,7 +378,28 @@ volumes:
   # bumps; only `compose down -v` removes it. Covered by the nightly
   # backup and the restore drill (OBI-241), the same as mudlib/postgres.
   saves:
+  # OBI-192/B3.5 (D-B3.2/D-B3.6): the separate Git dir (`GIT_DIR=
+  # /mudlib-git/warp.git`) that backs the `/mudlib` work tree. Kept apart
+  # from `mudlib` itself so nothing named `.git` ever exists under the
+  # confined VFS root loom-vm resolves paths against.
+  mudlib-git:
   caddy-data:
   caddy-config:
   prometheus-data:
   grafana-data:
+
+# OBI-192/B3.5 (D-B3.11/D-B3.12): file-based secrets (plain `docker
+# compose`, not swarm): loom-gitops#36 review (B3) -- `mode:`/`target:`
+# above are bind-mount hints only; plain (non-swarm) Compose does not
+# translate them, so the enforcement that actually matters is the *host*
+# file's own owner/mode: 0400, owned by numeric uid 10001 (the container's
+# `loom` user, Dockerfile `useradd --uid 10001`) -- not whatever uid the
+# host's own `loom` service account happens to have. See RUNBOOK.md §12
+# and reconcile.sh (placeholder install) for how that ownership is set.
+# Real values never get committed -- see .gitignore and
+# staging/secrets/*.example.
+secrets:
+  warp_app_pem:
+    file: ./secrets/warp_app.pem
+  warp_webhook:
+    file: ./secrets/warp_webhook

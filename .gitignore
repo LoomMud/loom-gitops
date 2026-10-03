@@ -6,3 +6,10 @@
 # `alerts` compose services. Host-local runtime data, not repo content.
 /staging/alerts-state/*
 !/staging/alerts-state/.gitkeep
+
+# OBI-192/B3.5 (D-B3.11/D-B3.12): the real GitHub App private key and
+# webhook HMAC secret. Only the *.example placeholders are tracked; the
+# real files live solely on the host at 0400, owned by the `loom` uid
+# (SETUP.md), and are never committed.
+/staging/secrets/warp_app.pem
+/staging/secrets/warp_webhook

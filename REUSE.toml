@@ -12,3 +12,10 @@ path = ["LICENSES/**"]
 precedence = "aggregate"
 SPDX-FileCopyrightText = "2026 Oberfield"
 SPDX-License-Identifier = "AGPL-3.0-only"
+
+[[annotations]]
+# OBI-192/B3.5: plain placeholder text, not a format with a comment
+# syntax reuse can inject a header into.
+path = ["staging/secrets/*.example"]
+SPDX-FileCopyrightText = "2026 Oberfield"
+SPDX-License-Identifier = "AGPL-3.0-only"

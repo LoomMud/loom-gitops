@@ -30,6 +30,25 @@ loommud.com, www.loommud.com {
 	@metrics path /metrics /metrics/*
 	respond @metrics 404
 
+	# GitHub App webhook delivery for `propose` (D-B3.12, OBI-192/B3.5):
+	# `loom-http` itself does the real validation (HMAC over
+	# `/run/secrets/warp_webhook`, delivery dedupe, 1 MiB body cap, 30/min
+	# rate limit). The `method POST` matcher is cosmetic, not a security
+	# boundary (loom-gitops#36 review, S2): a stray GET to this same path
+	# doesn't get rejected here -- it just falls through to the catch-all
+	# `reverse_proxy` below, which also forwards to `loom:8080`, so
+	# `loom-http` ends up 405-ing it either way. Kept anyway because it
+	# documents intent and skips a matcher evaluation for the common case.
+	@github-webhook {
+		path /api/v1/hooks/github
+		method POST
+	}
+	reverse_proxy @github-webhook loom:8080 {
+		# Same as the catch-all below: loom-http's rate limiter and any
+		# per-IP webhook accounting key off a consistent client IP.
+		header_up X-Forwarded-For {remote_host}
+	}
+
 	# WebSocket upgrades (the web client's game connection) and everything
 	# else go to loom's internal HTTP port. Caddy's reverse_proxy handles
 	# the Upgrade/Connection headers for WSS automatically.

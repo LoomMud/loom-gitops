@@ -214,7 +214,7 @@ jobs:
           set -euo pipefail
           . staging/images.env
           network="$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}' "$PG_CID")"
-          mkdir -p "$RUNNER_TEMP/mudlib-stub"
+          mkdir -p "$RUNNER_TEMP/mudlib-stub" "$RUNNER_TEMP/mudlib-git-stub"
           docker run --rm \
             --network "$network" \
             --add-host "devstoreaccount1.blob.core.windows.net:host-gateway" \
@@ -227,6 +227,7 @@ jobs:
             -v "$PWD/staging/backup.sh:/scripts/backup.sh:ro" \
             -v "$RUNNER_TEMP/mudlib-stub:/mudlib:ro" \
             -v "$RUNNER_TEMP/saves-stub:/saves:ro" \
+            -v "$RUNNER_TEMP/mudlib-git-stub:/mudlib-git:ro" \
             "$BACKUP_IMAGE" /bin/sh /scripts/backup.sh | tee "$RUNNER_TEMP/backup.log"
           grep -q '^.* backup: done: ' "$RUNNER_TEMP/backup.log"
           # Mirrors backup.sh's own dow->prefix logic (RUNBOOK.md §6): the

@@ -70,6 +70,16 @@ jobs:
           # SC2015 (restore.sh usage guard): `A && B || C` is intentional here; C (usage)
           # only runs when a required arg check fails, and usage() always exits nonzero.
           shellcheck --exclude=SC1090,SC1091,SC2015 staging/*.sh
+      - name: provision placeholder git secrets (OBI-192/B3.5, D-B3.11/D-B3.12)
+        run: |
+          set -euo pipefail
+          # Real values are never committed (.gitignore); CI (and a fresh
+          # clone generally) only has the *.example placeholders. compose
+          # needs *some* file at these paths for the `loom` service's
+          # `secrets:` entries to resolve, even though `loom` itself never
+          # boots in this job (private GHCR image, OBI-109).
+          install -m 0400 staging/secrets/warp_app.pem.example staging/secrets/warp_app.pem
+          install -m 0400 staging/secrets/warp_webhook.example staging/secrets/warp_webhook
       - name: render full compose config (no image pull)
         run: |
           set -euo pipefail
@@ -86,14 +96,33 @@ jobs:
           docker run --rm \
             -v "$PWD/staging/Caddyfile:/etc/caddy/Caddyfile:ro" \
             "$CADDY_IMAGE" caddy validate --config /etc/caddy/Caddyfile
-      # Full drill requested in the loom-gitops#8 review: `up -d` once, then
-      # again, proving the second run recreates nothing and does not reset
-      # the mudlib volume. `loom`/`caddy` can't be pulled here yet (private
-      # GHCR image, blocked on OBI-109), so "full" is postgres + mudlib-sync
-      # -- the two services that own the D-P1.11 idempotency bug this task
-      # fixes. That gap is tracked, not hidden: see the loom/caddy pull step
-      # below.
-      - name: up -d (boot 1)
+      # Full drill requested in the loom-gitops#8 review, extended for B3.5
+      # (OBI-192, D-B3.6): `up -d` once (seeds `/mudlib-git/warp.git` +
+      # `/mudlib`), again (must not recreate containers, re-seed, or touch
+      # either volume), then once more with a bumped WARP_REF (must still
+      # be a pure no-op -- WARP_REF is bootstrap-only once a tree exists).
+      # `loom`/`caddy` can't be pulled here yet (private GHCR image,
+      # blocked on OBI-109), so "full" is postgres + mudlib-sync -- the two
+      # services these checks are about. That gap is tracked, not hidden:
+      # see the loom/caddy pull step below.
+      - name: pre-populate /mudlib with a pre-B3 (D-P1.11) tree -- migration regression guard (B1)
+        run: |
+          set -euo pipefail
+          . staging/images.env
+          # loom-gitops#36 review (B1): staging's real `mudlib` volume predates
+          # B3 and already holds a read-only tree + `.warp-ref` (the old
+          # D-P1.11 reset-on-bump marker) the first time mudlib-sync's
+          # seed-only logic runs there. Reproduce that here: an untracked
+          # file plus `.warp-ref`, created before boot 1 ever runs, so this
+          # is a real regression guard for "seeding over an existing
+          # pre-B3 volume", not just an empty-volume happy path.
+          docker volume create loom_mudlib >/dev/null
+          docker run --rm -v loom_mudlib:/m alpine sh -c '
+            set -eu
+            echo "pre-B3 leftover" > /m/some-pre-existing-file.txt
+            echo 618b90c6a1e18a215f6c44af4ea1efbd7912e93e > /m/.warp-ref
+          '
+      - name: up -d (boot 1) -- seeds /mudlib-git/warp.git + /mudlib
         env:
           # OBI-130 DB role separation: three throwaway CI passwords, one per
           # login (POSTGRES_SUPERUSER_PASSWORD bootstraps loom_owner/loom_app
@@ -104,6 +133,7 @@ jobs:
           LOOM_APP_PASSWORD: ci-throwaway-app-password
         run: |
           set -euo pipefail
+          . staging/images.env
           docker compose --env-file staging/images.env --env-file staging/secrets.env.example \
             -f staging/compose.yaml up -d postgres mudlib-sync
           for i in $(seq 1 30); do
@@ -114,10 +144,20 @@ jobs:
           [ "$status" = healthy ] || { echo "postgres never became healthy"; docker compose --env-file staging/images.env --env-file staging/secrets.env.example -f staging/compose.yaml logs postgres; exit 1; }
           mudlib_sync_cid="$(docker compose --env-file staging/images.env --env-file staging/secrets.env.example -f staging/compose.yaml ps -a -q mudlib-sync)"
           [ "$(docker inspect -f '{{.State.ExitCode}}' "$mudlib_sync_cid")" = 0 ] || { docker compose --env-file staging/images.env --env-file staging/secrets.env.example -f staging/compose.yaml logs mudlib-sync; exit 1; }
-          # mudlib-sync strips /mudlib/.git after checkout (compose.yaml), so identity is
-          # tracked by the .warp-ref marker file written at the end of the script (this
-          # task's fix for the review's wipe-on-every-reconcile bug), not `git log`.
-          docker run --rm -v loom_mudlib:/m alpine cat /m/.warp-ref
+          # D-B3.6/D-B3.2: a real GIT_DIR at /mudlib-git/warp.git with `live`
+          # at WARP_REF, nothing named `.git` anywhere under /mudlib, and
+          # (B1 regression guard) the pre-B3 leftovers seeded above --
+          # including `.warp-ref` -- are gone, not merely left alongside the
+          # freshly checked-out tree (GIT_SYNC_IMAGE carries `git`; the
+          # plain `alpine` used elsewhere in this job does not).
+          docker run --rm --entrypoint sh -v loom_mudlib-git:/g -v loom_mudlib:/m "$GIT_SYNC_IMAGE" -c '
+            set -eu
+            git --git-dir=/g/warp.git rev-parse --verify live^{commit} >/dev/null
+            [ ! -e /m/.git ]
+            [ ! -e /m/.warp-ref ]
+            [ ! -e /m/some-pre-existing-file.txt ]
+            [ -n "$(ls -A /m)" ]
+          '
           # OBI-130: both least-privilege logins authenticate over TCP (password
           # auth, not the local trust socket). The owner password deliberately
           # contains a single quote, proving 01-create-roles.sh quotes via psql
@@ -127,36 +167,67 @@ jobs:
           docker exec -e PGPASSWORD="$LOOM_APP_PASSWORD" "$pg_cid" psql -h 127.0.0.1 -U loom_app -d loom -tAc "select current_user, rolsuper from pg_roles where rolname=current_user" | grep -qx 'loom_app|f' || { echo "loom_app login check failed (or it is a superuser)"; exit 1; }
           echo "boot 1: postgres healthy, mudlib-sync exited 0, container ids:"
           docker compose --env-file staging/images.env --env-file staging/secrets.env.example -f staging/compose.yaml ps -a --format 'table {{.Name}}\t{{.ID}}\t{{.Status}}'
-      - name: up -d (boot 2) -- must not recreate containers or reset mudlib
+      - name: up -d (boot 2) -- must not recreate containers or reset mudlib/mudlib-git
         env:
           # Same values as boot 1: postgres's environment is baked from these at
           # compose-parse time, so a mismatch here (not present in
           # secrets.env.example) would recreate the container for a reason
-          # that has nothing to do with the D-P1.11 bug this job checks for.
+          # that has nothing to do with the D-B3.6 bug this job checks for.
           POSTGRES_SUPERUSER_PASSWORD: ci-throwaway-superuser-password
           LOOM_OWNER_PASSWORD: "ci-throwaway-owner-pass'word"
           LOOM_APP_PASSWORD: ci-throwaway-app-password
         run: |
           set -euo pipefail
+          . staging/images.env
           compose() {
             docker compose --env-file staging/images.env --env-file staging/secrets.env.example -f staging/compose.yaml "$@"
           }
+          live_sha() { docker run --rm -v loom_mudlib-git:/g "$GIT_SYNC_IMAGE" --git-dir=/g/warp.git rev-parse live; }
+          mudlib_hash() { docker run --rm -v loom_mudlib:/m alpine sh -c 'find /m -type f | sort | xargs -r sha256sum' | sha256sum; }
           before_postgres_id="$(compose ps -q postgres)"
-          before_ref="$(docker run --rm -v loom_mudlib:/m alpine cat /m/.warp-ref)"
-          before_hash="$(docker run --rm -v loom_mudlib:/m alpine sh -c 'find /m -type f | sort | xargs -r sha256sum' | sha256sum)"
+          before_live="$(live_sha)"
+          before_hash="$(mudlib_hash)"
           # Scoped to postgres + mudlib-sync: `loom`/`caddy` can't be pulled here yet
           # (private GHCR image, OBI-109), and an unscoped `up -d` would try and fail
           # on those two before ever reaching the idempotency check this job exists for.
           compose up -d postgres mudlib-sync
           after_postgres_id="$(compose ps -q postgres)"
-          after_ref="$(docker run --rm -v loom_mudlib:/m alpine cat /m/.warp-ref)"
-          after_hash="$(docker run --rm -v loom_mudlib:/m alpine sh -c 'find /m -type f | sort | xargs -r sha256sum' | sha256sum)"
+          after_live="$(live_sha)"
+          after_hash="$(mudlib_hash)"
           [ "$before_postgres_id" = "$after_postgres_id" ] || { echo "postgres container was recreated on a no-op reconcile"; exit 1; }
-          [ "$before_ref" = "$after_ref" ] || { echo ".warp-ref changed on a no-op re-run"; exit 1; }
-          [ "$before_hash" = "$after_hash" ] || { echo "mudlib-sync reset the volume on a no-op re-run (D-P1.11 violated)"; exit 1; }
+          [ "$before_live" = "$after_live" ] || { echo "live moved on a no-op re-run"; exit 1; }
+          [ "$before_hash" = "$after_hash" ] || { echo "mudlib-sync reset the volume on a no-op re-run (D-B3.6 violated)"; exit 1; }
           mudlib_sync_exit="$(docker inspect -f '{{.State.ExitCode}}' "$(compose ps -a -q mudlib-sync)")"
           [ "$mudlib_sync_exit" = 0 ] || { compose logs mudlib-sync; exit 1; }
-          echo "boot 2: postgres container id unchanged ($after_postgres_id), .warp-ref unchanged ($after_ref), mudlib volume hash unchanged, mudlib-sync exited 0"
+          echo "boot 2: postgres container id unchanged ($after_postgres_id), live unchanged ($after_live), mudlib volume hash unchanged, mudlib-sync exited 0"
+      - name: up -d (boot 3) -- a WARP_REF bump must not reset an already-seeded volume (D-B3.6)
+        env:
+          POSTGRES_SUPERUSER_PASSWORD: ci-throwaway-superuser-password
+          LOOM_OWNER_PASSWORD: "ci-throwaway-owner-pass'word"
+          LOOM_APP_PASSWORD: ci-throwaway-app-password
+          # Doesn't even resolve on the remote -- if mudlib-sync ever read
+          # WARP_REF again after the first seed (a regression back towards
+          # the old D-P1.11 reset-on-bump behaviour) this would fail loudly
+          # (a fetch of a nonexistent ref) instead of silently passing.
+          WARP_REF: "0000000000000000000000000000000000000000"
+        run: |
+          set -euo pipefail
+          . staging/images.env
+          compose() {
+            docker compose --env-file staging/images.env --env-file staging/secrets.env.example -f staging/compose.yaml "$@"
+          }
+          live_sha() { docker run --rm -v loom_mudlib-git:/g "$GIT_SYNC_IMAGE" --git-dir=/g/warp.git rev-parse live; }
+          mudlib_hash() { docker run --rm -v loom_mudlib:/m alpine sh -c 'find /m -type f | sort | xargs -r sha256sum' | sha256sum; }
+          before_live="$(live_sha)"
+          before_hash="$(mudlib_hash)"
+          compose up -d postgres mudlib-sync
+          after_live="$(live_sha)"
+          after_hash="$(mudlib_hash)"
+          [ "$before_live" = "$after_live" ] || { echo "WARP_REF bump moved live after seeding (D-B3.6 violated)"; exit 1; }
+          [ "$before_hash" = "$after_hash" ] || { echo "WARP_REF bump reset the mudlib volume (D-B3.6 violated)"; exit 1; }
+          mudlib_sync_exit="$(docker inspect -f '{{.State.ExitCode}}' "$(compose ps -a -q mudlib-sync)")"
+          [ "$mudlib_sync_exit" = 0 ] || { compose logs mudlib-sync; exit 1; }
+          echo "boot 3: WARP_REF bump to a nonexistent ref was a no-op, live unchanged ($after_live), mudlib volume hash unchanged, mudlib-sync exited 0"
           compose down -v
       - name: attempt loom image pull (informational; expected to fail until OBI-109 makes it public)
         continue-on-error: true
