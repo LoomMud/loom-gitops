@@ -100,12 +100,22 @@ install_placeholder_secret() {
   local name="$1" real example
   real="$STAGING_DIR/secrets/$name"
   example="$STAGING_DIR/secrets/${name}.example"
-  [ -f "$real" ] && return 0
-  install -m 0400 "$example" "$real"
-  docker run --rm -v "$STAGING_DIR/secrets:/s" "$GIT_SYNC_IMAGE" \
-    sh -c "chown 10001:10001 '/s/$name'" \
-    || fail "could not chown placeholder secret $name to uid 10001"
-  log "installed placeholder secret $name from ${name}.example (real App not yet provisioned, Q-P2.3; see RUNBOOK.md section 12)"
+  local uid="${LOOM_UID:-10001}"
+  if [ ! -f "$real" ]; then
+    install -m 0400 "$example" "$real"
+    log "installed placeholder secret $name from ${name}.example (real App not yet provisioned, Q-P2.3; see RUNBOOK.md section 12)"
+  fi
+  # Ownership is checked on *every* run, not only right after install, so
+  # a run that installed the file but died before the chown self-heals
+  # (OBI-192 follow-up: the first rollout did exactly that). stat only
+  # needs search permission on the directory, not read on the file.
+  # `--entrypoint`: alpine/git's ENTRYPOINT is `git`, so without it
+  # `docker run <img> sh -c ...` runs `git sh -c ...` and fails.
+  [ "$(stat -c %u "$real")" = "$uid" ] && return 0
+  docker run --rm --entrypoint chown -v "$STAGING_DIR/secrets:/s" \
+    "$GIT_SYNC_IMAGE" "$uid:$uid" "/s/$name" \
+    || fail "could not chown secret $name to uid $uid"
+  log "chowned secret $name to uid $uid"
 }
 install_placeholder_secret warp_app.pem
 install_placeholder_secret warp_webhook
