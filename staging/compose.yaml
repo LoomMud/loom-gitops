@@ -394,7 +394,7 @@ volumes:
 # translate them, so the enforcement that actually matters is the *host*
 # file's own owner/mode: 0400, owned by numeric uid 10001 (the container's
 # `loom` user, Dockerfile `useradd --uid 10001`) -- not whatever uid the
-# host's own `loom` service account happens to have. See RUNBOOK.md §11
+# host's own `loom` service account happens to have. See RUNBOOK.md §12
 # and reconcile.sh (placeholder install) for how that ownership is set.
 # Real values never get committed -- see .gitignore and
 # staging/secrets/*.example.

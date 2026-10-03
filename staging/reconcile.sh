@@ -86,7 +86,7 @@ compose() {
 # 1.5. B3/OBI-192 (D-B3.11/D-B3.12, loom-gitops#36 review B2): compose's
 # `secrets:` entries need *some* file at these host paths or `up` fails
 # outright, and nothing installs the real ones automatically (they're
-# gitignored, provisioned by hand once Q-P2.3 lands -- RUNBOOK.md §11).
+# gitignored, provisioned by hand once Q-P2.3 lands -- RUNBOOK.md §12).
 # Install the tracked `*.example` placeholders the first time either real
 # file is missing, so a fresh host's first reconcile doesn't fail on this.
 # Never overwrites a file that's already there (real or previously
@@ -105,7 +105,7 @@ install_placeholder_secret() {
   docker run --rm -v "$STAGING_DIR/secrets:/s" "$GIT_SYNC_IMAGE" \
     sh -c "chown 10001:10001 '/s/$name'" \
     || fail "could not chown placeholder secret $name to uid 10001"
-  log "installed placeholder secret $name from ${name}.example (real App not yet provisioned, Q-P2.3; see RUNBOOK.md section 11)"
+  log "installed placeholder secret $name from ${name}.example (real App not yet provisioned, Q-P2.3; see RUNBOOK.md section 12)"
 }
 install_placeholder_secret warp_app.pem
 install_placeholder_secret warp_webhook
