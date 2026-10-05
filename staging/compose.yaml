@@ -322,8 +322,8 @@ services:
         condition: service_healthy
 
   # One-shot alert check (OBI-175/P2-O4): reconcile/deploy failure,
-  # /readyz down > 2 min, backup failure, and runtime-error rate (once
-  # OBI-169/P2-B4 lands). Run every minute by loom-alerts.timer
+  # /readyz down > 2 min, backup failure, and runtime-error rate
+  # (OBI-169/P2-B4). Run every minute by loom-alerts.timer
   # (`docker compose --profile alerts run --rm alerts`). On the default
   # compose network so it can reach `loom:8080` directly, the same
   # reason `migrate`/`backup` don't need LOOM_HTTP_ADDR published to the
