@@ -329,7 +329,7 @@ Four checks, each independent:
 | `reconcile` | `staging/reconcile` commit status on `origin/main` is `failure`/`error` | GitHub combined-status API, authenticated with `GITHUB_ALERTS_TOKEN` (one call per pass) |
 | `readyz` | `GET http://loom:8080/readyz` has not returned `200` for >= 120s (`LOOM_ALERTS_READYZ_THRESHOLD_SECS`) | direct check against `loom`'s internal HTTP port |
 | `backup` | `backup.sh`'s last run wrote `failure` to `./alerts-state/backup-status` | shared bind mount between the `backup` and `alerts` services |
-| `error_rate` | the counter `loom_runtime_errors_total` (`LOOM_ALERTS_ERROR_METRIC`) increases faster than `LOOM_ALERTS_ERROR_RATE_THRESHOLD` (default 1/s, a placeholder) | `loom`'s `/metrics` |
+| `error_rate` | the counter `loom_runtime_errors_total` (`LOOM_ALERTS_ERROR_METRIC`) increases faster than `LOOM_ALERTS_ERROR_RATE_THRESHOLD` (default 0.05/s, i.e. 3 errors/min averaged over a pass) | `loom`'s `/metrics` |
 
 **These are all on-host checks and cannot see a host outage** (the host
 itself down, Docker dead, or the compose network unreachable): all four
@@ -341,14 +341,18 @@ Paperclip issue OBI-196, not yet
 built. Until then, a total host outage is this alerting system's blind
 spot.
 
-**`error_rate` is wired but inert until OBI-169 (P2-B4, the error inbox)
-lands and exports that counter.** Until then, `alerts.sh` logs a skip
-every run ("metric not present yet") and never fires. Once OBI-169 ships,
-confirm the metric name matches `LOOM_ALERTS_ERROR_METRIC` (override it
-in `secrets.env` or the service's `environment:` if it doesn't) and pick
-a real threshold with Aragorn/Gimli instead of the placeholder `1/s`,
-then fire it once on purpose the same way as the other three (below) and
-record the issue link on OBI-175.
+**`error_rate` shipped with OBI-169 (P2-B4, the error inbox, `v0.1.0-alpha.6`),
+which exports `loom_runtime_errors_total{program}` on `/metrics`** --
+the metric only appears after the first recorded error, so `/metrics`
+stays empty (200, length 0) until something actually errors. The
+threshold is `0.05/s` (3 errors/min averaged over a pass; Aragorn,
+OBI-280): `1/s` would let a broken `heart_beat` or `call_out` erroring
+about once a second -- the most likely real failure -- hover right at the
+edge and never reliably fire, while `0.05/s` stays quiet for an
+occasional builder typo and catches any looping failure within one or
+two passes. Revisit once there's a week of real data. Fire it once on
+purpose the same way as the other three (below) and record the issue
+link on OBI-175/OBI-280.
 
 ### Fire each one on purpose
 
@@ -382,6 +386,16 @@ echo "failure $(date -u '+%Y-%m-%dT%H:%M:%SZ')" > /opt/loom-gitops/staging/alert
 compose --profile alerts run --rm alerts
 echo "success $(date -u '+%Y-%m-%dT%H:%M:%SZ')" > /opt/loom-gitops/staging/alerts-state/backup-status
 compose --profile alerts run --rm alerts
+
+# error_rate: cause *genuine* runtime errors in loom (OBI-280) -- do not
+# fake /metrics or point the check at a stub. E.g. as a builder, load an
+# object whose heart_beat (or a repeating call_out) throws, or repeat a
+# failing command, for a couple of alerts passes (>= 0.05/s, i.e. >= 3
+# errors/min). Then dest/unload the object so the next pass sees the
+# rate drop back under threshold and resolves.
+compose --profile alerts run --rm alerts   # fires once the rate clears 0.05/s
+# ... dest/unload the offending object here ...
+compose --profile alerts run --rm alerts   # resolves once the rate is back down
 ```
 
 Evidence for each firing (the opened/closed issue URL, plus the relevant
