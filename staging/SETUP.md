@@ -850,6 +850,16 @@ scoped the other way around.
    *Commit statuses: Read-only*, *Issues: Read and write* and
    *Metadata: Read-only*.
 
+**Current token (installed 2026-10-05, OBI-175 / OBI-223):** created by the
+board and delivered as the Paperclip secret `github_alerts_token`. Aragorn
+installed it into `/etc/loom/secrets.env` (`root:loom 0640`). It is a
+fine-grained token (`github_pat_` prefix). **Expiry: none reported.** GitHub
+returned no `github-authorization-token-expiration` header on 2026-10-05, which
+means the token was created with no expiration date. That breaks the policy
+above: the board should rotate it to one with an expiry and record the date
+here. The real permission list only shows on the token's settings page; the
+API can't confirm it, because all three LoomMud repos are public.
+
 ### 8.2 GHCR: make `ghcr.io/loommud/loom` public
 > **Timing:** the package only exists after the first R5 release pushes an image (OBI-29). As of 2026-09-26 it doesn't exist yet (`Package not found`). Do this step as soon as the first image is published. Gandalf/Legolas will say when on OBI-56.
 
