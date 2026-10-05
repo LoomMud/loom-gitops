@@ -27,11 +27,11 @@
 #      directory into both services).
 #   4. runtime-error rate above a threshold: reads the counter
 #      LOOM_ALERTS_ERROR_METRIC (default loom_runtime_errors_total,
-#      OBI-169/P2-B4) off http://loom:8080/metrics. Until OBI-169 lands
-#      and exports that counter, this check logs a skip and does nothing
-#      -- there is nothing to alert on yet. If OBI-169 names the counter
-#      differently, override LOOM_ALERTS_ERROR_METRIC rather than editing
-#      this script.
+#      OBI-169/P2-B4, loom >= v0.1.0-alpha.6, labelled {program}) off
+#      http://loom:8080/metrics. loom only exports the counter after the
+#      first recorded runtime error, so until then this check logs a skip
+#      and does nothing. To rename it, override LOOM_ALERTS_ERROR_METRIC
+#      rather than editing this script.
 #
 # Dry run: set LOOM_ALERTS_DRY_RUN=1 to log what would fire/resolve
 # without calling the GitHub API at all (no token needed) -- used by the
@@ -270,21 +270,21 @@ check_error_rate() {
     return 0
   fi
   metrics="$(curl -s --max-time 5 "${LOOM_HTTP_BASE}/metrics" 2>/dev/null || true)"
-  # TODO(OBI-169/P2-B4): once the real counter lands, confirm whether it's
-  # single-series or carries labels. For now this: (a) excludes Prometheus
+  # loom (OBI-169) exports one series per erroring program,
+  # loom_runtime_errors_total{program="..."}. This: (a) excludes Prometheus
   # client libraries' auto-generated "<metric>_created" gauge, which starts
   # with the same name prefix and would otherwise be matched and misread as
   # a second/foreign sample of the counter itself (CTO review on PR #34
   # item 4); (b) if the real metric is labelled (multiple series, e.g. per
   # error kind), sums every matching series into one combined counter
   # rather than reading only the first -- a reasonable default for a
-  # single alert threshold, revisit once OBI-169 defines the real SLO.
+  # single alert threshold (0.05/s, OBI-280).
   value="$(printf '%s\n' "$metrics" | awk -v m="$ERROR_METRIC" '
     $1 == m || ($1 ~ "^" m "\\{") { sum += $2; found = 1 }
     END { if (found) printf "%.6f", sum }
   ')"
   if [ -z "$value" ]; then
-    log "metric '${ERROR_METRIC}' not present yet (OBI-169/P2-B4 not landed); skipping error-rate check"
+    log "metric '${ERROR_METRIC}' not present yet (no runtime error recorded since loom started); skipping error-rate check"
     return 0
   fi
   prev_file="$STATE_DIR/error-rate-prev"
@@ -310,7 +310,7 @@ check_error_rate() {
   over="$(awk -v r="$rate" -v th="$ERROR_RATE_THRESHOLD" 'BEGIN { print (r > th) ? 1 : 0 }')"
   if [ "$over" = "1" ]; then
     notify_fire error_rate "[ALERT] staging runtime-error rate is ${rate}/s (threshold ${ERROR_RATE_THRESHOLD}/s)" \
-      "Metric ${ERROR_METRIC} increased by ${dv} over ${dt}s (rate ${rate}/s), above the ${ERROR_RATE_THRESHOLD}/s threshold. See the errors command / /api/v1/errors (OBI-169) for detail."
+      "Metric ${ERROR_METRIC} increased by ${dv} over ${dt}s (rate ${rate}/s), above the ${ERROR_RATE_THRESHOLD}/s threshold. See the in-game errors command (OBI-169) for detail."
   else
     notify_resolve error_rate "runtime-error rate back to ${rate}/s"
   fi

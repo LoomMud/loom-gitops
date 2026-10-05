@@ -314,7 +314,7 @@ jobs:
             LOOM_ALERTS_ERROR_RATE_THRESHOLD=1 \
             sh staging/alerts.sh 2>&1 | tee /tmp/alerts-ci.log
           grep -q "\[dry-run\] would fire 'error_rate'" /tmp/alerts-ci.log
-      - name: error-rate check -- metric absent, skips cleanly (no OBI-169 yet)
+      - name: error-rate check -- metric absent, skips cleanly (no error recorded yet)
         run: |
           set -euo pipefail
           rm -rf /tmp/alerts-ci2; mkdir -p /tmp/alerts-ci2
@@ -331,7 +331,7 @@ jobs:
           LOOM_ALERTS_DRY_RUN=1 LOOM_ALERTS_STATE_DIR=/tmp/alerts-ci2 \
             LOOM_ALERTS_LOOM_HTTP_BASE=http://127.0.0.1:18998 \
             sh staging/alerts.sh 2>&1 | tee /tmp/alerts-ci2.log
-          grep -q "not present yet (OBI-169/P2-B4 not landed)" /tmp/alerts-ci2.log
+          grep -q "not present yet (no runtime error recorded since loom started)" /tmp/alerts-ci2.log
       - name: error-rate check -- ignores the Prometheus client's auto _created series (CTO review item 4)
         run: |
           set -euo pipefail
