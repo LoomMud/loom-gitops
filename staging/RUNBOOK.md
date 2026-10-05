@@ -326,7 +326,7 @@ Four checks, each independent:
 
 | Alert | Condition | Source |
 |---|---|---|
-| `reconcile` | `staging/reconcile` commit status on `origin/main` is `failure`/`error` | GitHub commits API (unauthenticated read; public repo) |
+| `reconcile` | `staging/reconcile` commit status on `origin/main` is `failure`/`error` | GitHub combined-status API, authenticated with `GITHUB_ALERTS_TOKEN` (one call per pass) |
 | `readyz` | `GET http://loom:8080/readyz` has not returned `200` for >= 120s (`LOOM_ALERTS_READYZ_THRESHOLD_SECS`) | direct check against `loom`'s internal HTTP port |
 | `backup` | `backup.sh`'s last run wrote `failure` to `./alerts-state/backup-status` | shared bind mount between the `backup` and `alerts` services |
 | `error_rate` | the counter `loom_runtime_errors_total` (`LOOM_ALERTS_ERROR_METRIC`) increases faster than `LOOM_ALERTS_ERROR_RATE_THRESHOLD` (default 1/s, a placeholder) | `loom`'s `/metrics` |
@@ -337,7 +337,7 @@ run as `docker compose --profile alerts run --rm alerts` on the same
 host they're checking, so if the host is down, nothing runs `alerts.sh`
 at all and no alert fires for that. An off-host probe (pinging the host
 from somewhere else entirely) is filed separately as
-[OBI-196](https://github.com/LoomMud/loom-gitops/issues/196), not yet
+Paperclip issue OBI-196, not yet
 built. Until then, a total host outage is this alerting system's blind
 spot.
 
