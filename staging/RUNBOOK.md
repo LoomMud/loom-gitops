@@ -335,11 +335,35 @@ Four checks, each independent:
 itself down, Docker dead, or the compose network unreachable): all four
 run as `docker compose --profile alerts run --rm alerts` on the same
 host they're checking, so if the host is down, nothing runs `alerts.sh`
-at all and no alert fires for that. An off-host probe (pinging the host
-from somewhere else entirely) is filed separately as
-Paperclip issue OBI-196, not yet
-built. Until then, a total host outage is this alerting system's blind
-spot.
+at all and no alert fires for that.
+
+**Off-host probe (OBI-196/P2-O4 follow-up):** `.github/workflows/readyz-external.yml`
+closes that blind spot. It runs on GitHub's own runners, not the staging
+host, on a `schedule:` cron of roughly every 5 minutes (also
+`workflow_dispatch`-able on demand, with a `target_url` input to point it
+at a known-bad URL for a deliberate test fire) and curls
+`https://loommud.com/readyz` the way a player would -- through
+Cloudflare, over the public internet -- so it still fires if the whole
+host or Docker is down, not just if `loom` itself is unhealthy. It
+re-checks once, 15s later, before treating a failed probe as real (a
+single blip doesn't fire). Same delivery channel and state machine as
+`alerts.sh` (a GitHub issue labeled `alert` in this repo, opened on
+firing, commented on while still firing -- throttled 15 min -- closed on
+recovery), keyed by a dedicated `readyz-external` label instead of a
+local state file (Actions runners don't keep one between runs, so each
+run re-derives "is there already an open incident?" and "when did it
+last comment?" from the issue itself via the GitHub search API).
+
+Uses the workflow's own scoped `GITHUB_TOKEN` (`permissions: issues:
+write` in the workflow file itself), not a separate PAT -- nothing to
+provision in `secrets.env` or rotate for this one.
+
+**GitHub Actions `schedule:` cron is best-effort**, not a guarantee:
+GitHub documents that scheduled workflows "may be delayed during periods
+of high loads of GitHub Actions workflow runs," and enforces a 5-minute
+floor on cron granularity regardless. Treat this as a second,
+independent, slower signal alongside `alerts.sh`'s tighter on-host
+checks -- not a replacement for them.
 
 **`error_rate` shipped with OBI-169 (P2-B4, the error inbox, `v0.1.0-alpha.6`),
 which exports `loom_runtime_errors_total{program}` on `/metrics`** --
