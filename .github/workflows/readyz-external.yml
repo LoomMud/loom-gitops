@@ -1,0 +1,136 @@
+# SPDX-FileCopyrightText: 2026 Oberfield
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# OBI-196 (P2-O4 follow-up): staging/alerts.sh (OBI-175) runs *on* the
+# staging host, inside `docker compose --profile alerts`, so a whole-host
+# or Docker outage -- the likely shape of the 09-28 retro R3 outage --
+# raises nothing: nothing runs alerts.sh at all. This workflow is the
+# off-host probe CTO review finding 5 on PR #34 asked for: it runs on
+# GitHub's runners, not the staging host, and reaches the site the way a
+# player would -- through Cloudflare -- so it can see the host being
+# completely gone.
+#
+# Delivers to the same channel staging/alerts.sh already uses: a GitHub
+# issue labeled `alert` in this repo, keyed `readyz-external` (its own
+# label, so it never collides with alerts.sh's host-side `readyz` check
+# or its state files). Opened on the transition into "firing", commented
+# on while it keeps firing (throttled to once per 15 minutes, matching
+# alerts.sh's COMMENT_THROTTLE_SECS), closed on recovery -- same state
+# machine as alerts.sh, just re-derived each run from the GitHub issue
+# itself (search for an open `alert`+`readyz-external` issue) instead of
+# a local state file, because Actions runners don't keep one between runs.
+#
+# Uses the workflow's own scoped, ephemeral GITHUB_TOKEN (`issues: write`
+# below), not a long-lived PAT -- least privilege, and nothing to rotate
+# or leak.
+#
+# Cadence and reliability notes (RUNBOOK.md §11):
+#   - `schedule:` cron is GitHub Actions' own clock, not ours, and it is
+#     documented as best-effort: "scheduled workflows may be delayed
+#     during periods of high loads of GitHub Actions workflow runs" (and
+#     the platform enforces a 5-minute floor on cron granularity anyway).
+#     This can miss a brief outage or report one late; it is a second,
+#     independent signal, not a replacement for staging/alerts.sh's
+#     tighter on-host checks.
+#   - A single failed probe re-checks once more 15s later before firing,
+#     so a one-off network blip between GitHub's runners and Cloudflare
+#     doesn't open an issue by itself.
+name: readyz-external
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      target_url:
+        description: >-
+          Override the probed URL (point this at something that will
+          fail, e.g. https://loommud.com/does-not-exist, to fire the
+          alert on purpose; leave blank for the real check).
+        required: false
+        default: ""
+permissions:
+  contents: read
+  issues: write
+concurrency:
+  group: readyz-external
+  cancel-in-progress: false
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe /readyz and manage the alert issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TARGET_URL: ${{ github.event.inputs.target_url || 'https://loommud.com/readyz' }}
+          KEY: readyz-external
+          THROTTLE_SECS: "900"
+        run: |
+          set -euo pipefail
+
+          log() { printf '%s readyz-external: %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"; }
+
+          # Idempotent: 422 (already exists) is fine and expected after the first run.
+          gh api -X POST "repos/${REPO}/labels" \
+            -f name="${KEY}" -f color="b60205" \
+            -f description="Off-host /readyz probe, OBI-196" >/dev/null 2>&1 || true
+
+          probe() {
+            curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$TARGET_URL" 2>/dev/null || echo 000
+          }
+
+          code1="$(probe)"
+          log "probe 1: HTTP ${code1} against ${TARGET_URL}"
+          healthy=0
+          code2=""
+          if [ "$code1" = "200" ]; then
+            healthy=1
+          else
+            sleep 15
+            code2="$(probe)"
+            log "probe 2 (confirm, +15s): HTTP ${code2} against ${TARGET_URL}"
+            [ "$code2" = "200" ] && healthy=1
+          fi
+
+          existing="$(gh api -X GET search/issues \
+            -f q="repo:${REPO} is:issue label:alert label:${KEY} state:open" \
+            --jq '.items[0].number // empty')"
+
+          if [ "$healthy" = "1" ]; then
+            if [ -n "$existing" ]; then
+              gh api -X POST "repos/${REPO}/issues/${existing}/comments" \
+                -f body="resolved: ${TARGET_URL} returned HTTP 200 again (off-host probe, OBI-196)." >/dev/null
+              gh api -X PATCH "repos/${REPO}/issues/${existing}" -f state="closed" >/dev/null
+              log "resolved and closed #${existing}"
+            else
+              log "healthy, no open incident"
+            fi
+            exit 0
+          fi
+
+          body="Both probes against ${TARGET_URL} failed from GitHub Actions (HTTP ${code1}, then HTTP ${code2:-$code1} after a 15s re-check) -- an off-host check (OBI-196), run on GitHub's runners rather than the staging host itself, so it can still see a whole-host or Docker outage that staging/alerts.sh (OBI-175, which runs on-host) cannot. See staging/RUNBOOK.md section 11."
+
+          if [ -z "$existing" ]; then
+            number="$(gh api -X POST "repos/${REPO}/issues" \
+              -f title="[ALERT] off-host probe: ${TARGET_URL} is down" \
+              -f body="$body" \
+              -f "labels[]=alert" -f "labels[]=${KEY}" -f "labels[]=bug" \
+              --jq '.number')"
+            log "fired: opened #${number}"
+            exit 0
+          fi
+
+          # Still firing. No state carries over between runs, so the
+          # throttle is re-derived from the issue's own timeline each time:
+          # the last comment, or its creation if there's no comment yet.
+          last_iso="$(gh api -X GET "repos/${REPO}/issues/${existing}/comments" --jq '.[-1].created_at // empty')"
+          [ -n "$last_iso" ] || last_iso="$(gh api -X GET "repos/${REPO}/issues/${existing}" --jq '.created_at')"
+          last_epoch="$(date -u -d "$last_iso" +%s)"
+          now_epoch="$(date -u +%s)"
+          since=$((now_epoch - last_epoch))
+          if [ "$since" -ge "$THROTTLE_SECS" ]; then
+            gh api -X POST "repos/${REPO}/issues/${existing}/comments" -f body="still firing: $body" >/dev/null
+            log "still firing (issue #${existing}); posted a throttled comment"
+          else
+            log "still firing (issue #${existing}); within throttle window (${since}s < ${THROTTLE_SECS}s)"
+          fi
